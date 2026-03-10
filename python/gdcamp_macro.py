@@ -13,6 +13,7 @@ Flow parity goals:
 from __future__ import annotations
 
 import argparse
+import base64
 import os
 import random
 import re
@@ -97,10 +98,34 @@ def send_telegram(bot_token: Optional[str], chat_id: Optional[str], msg: str) ->
 
 
 def js_wait_for_knockout(page: Page, timeout_ms: int = 15000) -> None:
-    page.wait_for_function(
-        """() => typeof ko !== 'undefined' && ko.dataFor(document.body)""",
-        timeout=timeout_ms,
-    )
+    """Wait until Knockout view model is available.
+
+    Avoid Playwright's `wait_for_function` here because some target pages can
+    monkey-patch globals used by Playwright's injected selector runtime,
+    causing runtime errors like `this._engines.set is not a function`.
+    """
+    deadline = time.time() + (timeout_ms / 1000)
+    while time.time() < deadline:
+        try:
+            ready = page.evaluate(
+                """
+                () => {
+                  try {
+                    return typeof ko !== 'undefined' && !!ko.dataFor(document.body);
+                  } catch (e) {
+                    return false;
+                  }
+                }
+                """
+            )
+        except Exception:  # noqa: BLE001
+            ready = False
+
+        if ready:
+            return
+        time.sleep(0.1)
+
+    raise TimeoutError("Knockout view model was not ready in time")
 
 
 def js_change_month_and_select_day(page: Page, target_month: int, target_day: int) -> bool:
@@ -234,15 +259,41 @@ def js_fill_captcha_and_confirm(page: Page, captcha_text: str) -> bool:
 
 
 def wait_and_capture_captcha(page: Page, timeout_ms: int = 10000) -> Optional[bytes]:
-    img = page.locator("div.ex_area img").first
-    try:
-        img.wait_for(state="visible", timeout=timeout_ms)
-    except Exception:  # noqa: BLE001
-        return None
-    try:
-        return img.screenshot(type="png")
-    except Exception:  # noqa: BLE001
-        return None
+    """Capture captcha image bytes without using Playwright locator APIs."""
+    deadline = time.time() + (timeout_ms / 1000)
+    while time.time() < deadline:
+        try:
+            data_url = page.evaluate(
+                """
+                () => {
+                  const img = document.querySelector('div.ex_area img');
+                  if (!img) return null;
+                  const width = img.naturalWidth || img.width;
+                  const height = img.naturalHeight || img.height;
+                  if (!width || !height) return null;
+
+                  const canvas = document.createElement('canvas');
+                  canvas.width = width;
+                  canvas.height = height;
+                  const ctx = canvas.getContext('2d');
+                  if (!ctx) return null;
+                  ctx.drawImage(img, 0, 0, width, height);
+                  return canvas.toDataURL('image/png');
+                }
+                """
+            )
+        except Exception:  # noqa: BLE001
+            data_url = None
+
+        if data_url and isinstance(data_url, str) and data_url.startswith('data:image/png;base64,'):
+            try:
+                return base64.b64decode(data_url.split(',', 1)[1])
+            except Exception:  # noqa: BLE001
+                return None
+
+        time.sleep(0.1)
+
+    return None
 
 
 def ensure_page(context: BrowserContext, cfg: MacroConfig) -> Page:
