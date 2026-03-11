@@ -3,7 +3,7 @@
 기존 `JS/content.js` + `JS/injectedScript.js` 동작 플로우를 Python으로 옮긴 매크로입니다.
 
 ## 변경점
-- OCR 엔진을 `tesseract`에서 `captchacracker`로 교체.
+- OCR 엔진을 `tesseract`에서 `CaptchaCracker`로 교체.
 - Knockout ViewModel 제어는 Playwright의 `page.evaluate()`로 동일하게 수행.
 
 ## 설치
@@ -35,7 +35,7 @@ python gdcamp_macro.py \
 2. 시설/사이트 선택(또는 빈자리 탐색)
 3. 예약 버튼 클릭
 4. CAPTCHA 이미지 캡처
-5. `captchacracker`로 OCR
+5. `CaptchaCracker`로 OCR
 6. CAPTCHA 입력 + 예약 확정 클릭
 7. 실패 시 reload 후 재시도
 

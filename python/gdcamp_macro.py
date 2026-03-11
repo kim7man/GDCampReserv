@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import inspect
 import os
 import random
 import re
@@ -38,46 +39,217 @@ class MacroConfig:
 
 
 class CaptchaCrackerAdapter:
-    """Wrapper to support multiple captchacracker API shapes."""
+    """Wrapper to support multiple CaptchaCracker API shapes."""
 
     def __init__(self) -> None:
-        try:
-            import captchacracker  # type: ignore
-        except Exception as exc:  # noqa: BLE001
+        lib = None
+        errors = []
+        for mod in ("CaptchaCracker", "captchacracker"):
+            try:
+                lib = __import__(mod)
+                break
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{mod}: {exc}")
+        if lib is None:
             raise RuntimeError(
-                "captchacracker import failed. Install with: pip install captchacracker"
-            ) from exc
-        self._lib = captchacracker
+                "CaptchaCracker import failed. Install with: pip install CaptchaCracker "
+                f"(errors: {' | '.join(errors)})"
+            )
+        self._lib = lib
+
+    def _signature_arg_candidates(self, fn: object, image_bytes: bytes, image_path: str):
+        try:
+            sig = inspect.signature(fn)
+            params = [p for p in sig.parameters.values() if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+        except Exception:  # noqa: BLE001
+            return []
+
+        if not params:
+            return []
+
+        candidates = []
+        first = params[0].name.lower()
+        if "path" in first or "file" in first:
+            candidates.append({params[0].name: image_path})
+        if "byte" in first or "image" in first or "img" in first or "data" in first:
+            candidates.append({params[0].name: image_bytes})
+        return candidates
+
+    def _try_apply_model_variants(self, owner: object, image_bytes: bytes) -> Optional[str]:
+        create_model = getattr(owner, "CreateModel", None)
+        apply_model = getattr(owner, "ApplyModel", None)
+        if not callable(apply_model):
+            return None
+
+        model_candidates = [None]
+        if callable(create_model):
+            for model_arg in (None, "", "default", "captcha", "core"):
+                try:
+                    model = create_model() if model_arg is None else create_model(model_arg)
+                    model_candidates.append(model)
+                except Exception:  # noqa: BLE001
+                    continue
+
+        import tempfile as _tempfile
+        with _tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tmp:
+            tmp.write(image_bytes)
+            tmp.flush()
+            payloads = [image_bytes, memoryview(image_bytes), tmp.name]
+
+            for model in model_candidates:
+                for payload in payloads:
+                    # positional attempts
+                    positional_attempts = []
+                    if model is None:
+                        positional_attempts.append((payload,))
+                    else:
+                        positional_attempts.extend([(model, payload), (payload, model)])
+
+                    for args in positional_attempts:
+                        try:
+                            result = apply_model(*args)
+                        except Exception:  # noqa: BLE001
+                            continue
+                        text = self._normalize(result)
+                        if text:
+                            return text
+
+                    # keyword attempts based on signature hints
+                    for kwargs in self._signature_arg_candidates(apply_model, image_bytes, tmp.name):
+                        try:
+                            if model is not None:
+                                kwargs = {**kwargs, "model": model}
+                            result = apply_model(**kwargs)
+                        except Exception:  # noqa: BLE001
+                            continue
+                        text = self._normalize(result)
+                        if text:
+                            return text
+
+        return None
 
     def solve_bytes(self, image_bytes: bytes) -> str:
         lib = self._lib
 
-        # Variant A: captchacracker.CaptchaCracker().solve(...)
-        if hasattr(lib, "CaptchaCracker"):
-            cracker = lib.CaptchaCracker()
-            if hasattr(cracker, "solve"):
-                text = cracker.solve(image_bytes)
-                return self._normalize(text)
-            if hasattr(cracker, "predict"):
-                text = cracker.predict(image_bytes)
-                return self._normalize(text)
+        def _try_call(fn: object) -> Optional[str]:
+            if not callable(fn):
+                return None
 
-        # Variant B: captchacracker.solve(...)
-        if hasattr(lib, "solve"):
-            text = lib.solve(image_bytes)
-            return self._normalize(text)
+            call_variants = [
+                (image_bytes,),
+                (memoryview(image_bytes),),
+            ]
 
-        # Variant C: captchacracker.crack(...)
-        if hasattr(lib, "crack"):
-            text = lib.crack(image_bytes)
-            return self._normalize(text)
+            import tempfile as _tempfile
+            with _tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tmp:
+                tmp.write(image_bytes)
+                tmp.flush()
+                call_variants.append((tmp.name,))
 
-        raise RuntimeError("Unsupported captchacracker API shape")
+                for args in call_variants:
+                    try:
+                        result = fn(*args)
+                    except TypeError:
+                        # try kwargs style if signature hints parameter names
+                        try:
+                            sig = inspect.signature(fn)
+                            params = list(sig.parameters)
+                            if not params:
+                                continue
+                            name = params[0].lower()
+                            if "path" in name or "file" in name:
+                                result = fn(**{params[0]: tmp.name})
+                            elif "byte" in name or "image" in name:
+                                result = fn(**{params[0]: image_bytes})
+                            else:
+                                continue
+                        except Exception:  # noqa: BLE001
+                            continue
+                    except Exception:  # noqa: BLE001
+                        continue
+
+                    text = self._normalize(result)
+                    if text:
+                        return text
+            return None
+
+        # Variant A: class-based API (e.g., CaptchaCracker().solve/predict/crack)
+        for cls_name in ("CaptchaCracker", "Solver", "Cracker"):
+            cls = getattr(lib, cls_name, None)
+            if cls is None:
+                continue
+            try:
+                inst = cls()
+            except Exception:  # noqa: BLE001
+                continue
+            for method_name in ("solve", "predict", "crack", "run", "decode", "recognize"):
+                text = _try_call(getattr(inst, method_name, None))
+                if text:
+                    return text
+
+        # Variant B: module-level callables
+        for fn_name in ("solve", "predict", "crack", "run", "decode", "recognize"):
+            text = _try_call(getattr(lib, fn_name, None))
+            if text:
+                return text
+
+        # Variant C: nested objects that expose solver methods
+        for attr_name in dir(lib):
+            if attr_name.startswith("_"):
+                continue
+            obj = getattr(lib, attr_name, None)
+            for method_name in ("solve", "predict", "crack", "run", "decode", "recognize"):
+                text = _try_call(getattr(obj, method_name, None))
+                if text:
+                    return text
+
+
+        # Variant D: CreateModel/ApplyModel style APIs
+        for owner in (lib, getattr(lib, "core", None)):
+            if owner is None:
+                continue
+            text = self._try_apply_model_variants(owner, image_bytes)
+            if text:
+                return text
+
+        # Soft fallback: do not crash macro loop on unknown API shape.
+        # Return empty text so caller can retry/reload.
+        public_attrs = [x for x in dir(lib) if not x.startswith('_')][:30]
+        print(
+            "[WARN] Unsupported CaptchaCracker API shape; available attrs sample: "
+            + ", ".join(public_attrs)
+        )
+        return ""
 
     @staticmethod
     def _normalize(value: object) -> str:
-        text = str(value) if value is not None else ""
-        return re.sub(r"\s+", "", text)
+        if value is None:
+            return ""
+
+        # Common structured returns
+        if isinstance(value, dict):
+            for key in ("text", "result", "value", "captcha", "code"):
+                if key in value:
+                    return CaptchaCrackerAdapter._normalize(value[key])
+            return ""
+
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                text = CaptchaCrackerAdapter._normalize(item)
+                if text:
+                    return text
+            return ""
+
+        if isinstance(value, bytes):
+            try:
+                value = value.decode("utf-8", errors="ignore")
+            except Exception:  # noqa: BLE001
+                return ""
+
+        text = str(value)
+        # Keep only alnum because captcha target is short token
+        text = re.sub(r"[^0-9A-Za-z]", "", text)
+        return text.strip()
 
 
 def send_telegram(bot_token: Optional[str], chat_id: Optional[str], msg: str) -> None:
@@ -296,11 +468,56 @@ def wait_and_capture_captcha(page: Page, timeout_ms: int = 10000) -> Optional[by
     return None
 
 
+
+
+def install_js_runtime_guards(context: BrowserContext) -> None:
+    """Guard native constructors from page-side monkey patching.
+
+    Some target pages overwrite built-in constructors (e.g. `Map`/`Set`).
+    Playwright utility scripts rely on these natives while parsing evaluation
+    results, which can trigger errors such as `refs.set is not a function`.
+    """
+    context.add_init_script(
+        """
+        (() => {
+          const g = globalThis;
+          const keep = {
+            Map: g.Map,
+            Set: g.Set,
+            WeakMap: g.WeakMap,
+            WeakSet: g.WeakSet,
+          };
+
+          for (const [name, value] of Object.entries(keep)) {
+            try {
+              Object.defineProperty(g, name, {
+                value,
+                writable: false,
+                configurable: false,
+                enumerable: false,
+              });
+            } catch (e) {
+              // ignore
+            }
+          }
+        })();
+        """
+    )
+
 def ensure_page(context: BrowserContext, cfg: MacroConfig) -> Page:
     page = context.new_page()
     page.goto(cfg.initial_url, wait_until="domcontentloaded")
     return page
 
+
+
+
+def is_known_playwright_eval_runtime_error(exc: Exception) -> bool:
+    msg = str(exc)
+    return (
+        "refs.set is not a function" in msg
+        or "this._engines.set is not a function" in msg
+    )
 
 def run_macro(cfg: MacroConfig) -> None:
     cracker = CaptchaCrackerAdapter()
@@ -308,6 +525,7 @@ def run_macro(cfg: MacroConfig) -> None:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=cfg.headless)
         context = browser.new_context()
+        install_js_runtime_guards(context)
         page = ensure_page(context, cfg)
 
         print("[INFO] 로그인 완료 상태를 확인한 뒤 엔터를 누르세요.")
@@ -377,8 +595,18 @@ def run_macro(cfg: MacroConfig) -> None:
             except Exception as exc:  # noqa: BLE001
                 print(f"[WARN] 예외 발생: {exc} -> reload")
                 try:
-                    page.reload(wait_until="domcontentloaded")
+                    if is_known_playwright_eval_runtime_error(exc):
+                        print("[WARN] Playwright evaluate runtime 오염 감지 -> context 재생성")
+                        context.close()
+                        context = browser.new_context()
+                        install_js_runtime_guards(context)
+                        page = ensure_page(context, cfg)
+                    else:
+                        page.reload(wait_until="domcontentloaded")
                 except Exception:  # noqa: BLE001
+                    context.close()
+                    context = browser.new_context()
+                    install_js_runtime_guards(context)
                     page = ensure_page(context, cfg)
 
         context.close()
