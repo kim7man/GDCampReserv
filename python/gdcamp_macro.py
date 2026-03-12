@@ -13,71 +13,83 @@ Flow parity goals:
 from __future__ import annotations
 
 import argparse
+import base64
+import inspect
 import os
 import random
 import re
 import time
+from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional
 
 from playwright.sync_api import BrowserContext, Page, sync_playwright
 
+import cv2
+import CaptchaCracker as cc
+import numpy as np
+
+
 
 @dataclass
 class MacroConfig:
-    target_month: int
-    target_day: int
-    area_name: int  # 0: family, 1: auto, 2: plum
-    site_no: int    # >0 fixed seat, <=0 scan for available
+    target_month: int = 4
+    target_day: int = 25
+    area_name: int = 2 # 0: family, 1: auto, 2: plum
+    site_no: int = 0   # >0 fixed seat, <=0 scan for available
     reload_interval_s: int = 600
-    initial_url: str = "https://camp.xticket.kr/web/main"
+    initial_url: str = "https://camp.xticket.kr/web/main?shopEncode=5f9422e223671b122a7f2c94f4e15c6f71cd1a49141314cf19adccb98162b5b0"
     headless: bool = False
-    telegram_bot_token: Optional[str] = None
-    telegram_chat_id: Optional[str] = None
+    telegram_bot_token: Optional[str] = os.getenv("TELEGRAM_BOT_TOKEN")
+    telegram_chat_id: Optional[str] = os.getenv("TELEGRAM_CHAT_ID")
+    captcha_dump_dir: Optional[str] = None
+    captcha_model_path: str = None
+    verbose: bool = False
+    img_width: int = 250
+    img_height: int = 85
 
+
+
+
+def debug_log(cfg: Optional[MacroConfig], message: str) -> None:
+    if cfg is not None and cfg.verbose:
+        print(f"[DEBUG] {message}")
 
 class CaptchaCrackerAdapter:
-    """Wrapper to support multiple captchacracker API shapes."""
+    def __init__(self, verbose: bool = False, model_path: str = None, img_width: int = 250, img_height: int = 85, max_length: int = 4, target_char: list = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9'}) -> None:
+        self._verbose = verbose
+        self._AM = cc.ApplyModel(model_path, img_width, img_height, max_length, target_char)
+        print(self._AM.predict("./0005.jpg"))
 
-    def __init__(self) -> None:
-        try:
-            import captchacracker  # type: ignore
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(
-                "captchacracker import failed. Install with: pip install captchacracker"
-            ) from exc
-        self._lib = captchacracker
+    def _log(self, msg: str) -> None:
+        if self._verbose:
+            print(f"[DEBUG][OCR] {msg}")
 
-    def solve_bytes(self, image_bytes: bytes) -> str:
-        lib = self._lib
+    def solve_bytes(self, image_bytes: str) -> str:
+        self._log(f"solve_bytes start size={len(image_bytes)}")
 
-        # Variant A: captchacracker.CaptchaCracker().solve(...)
-        if hasattr(lib, "CaptchaCracker"):
-            cracker = lib.CaptchaCracker()
-            if hasattr(cracker, "solve"):
-                text = cracker.solve(image_bytes)
-                return self._normalize(text)
-            if hasattr(cracker, "predict"):
-                text = cracker.predict(image_bytes)
-                return self._normalize(text)
+        img_array = np.frombuffer(image_bytes, dtype=np.uint8)
+        img = cv2.imdecode(img_array, cv2.IMREAD_GRAYSCALE)
+        _, th = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+        cv2.imwrite("./tmp.jpg", th)
+        text = self._AM.predict("./tmp.jpg")
+        return text
 
-        # Variant B: captchacracker.solve(...)
-        if hasattr(lib, "solve"):
-            text = lib.solve(image_bytes)
-            return self._normalize(text)
 
-        # Variant C: captchacracker.crack(...)
-        if hasattr(lib, "crack"):
-            text = lib.crack(image_bytes)
-            return self._normalize(text)
-
-        raise RuntimeError("Unsupported captchacracker API shape")
-
-    @staticmethod
-    def _normalize(value: object) -> str:
-        text = str(value) if value is not None else ""
-        return re.sub(r"\s+", "", text)
-
+def dump_captcha_image(captcha_bytes: bytes, dump_dir: Optional[str]) -> Optional[str]:
+    if not dump_dir:
+        return None
+    try:
+        os.makedirs(dump_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        path = os.path.join(dump_dir, f"captcha_{timestamp}.jpg")
+        cv2.imwrite(path, th)
+        with open(path, "wb") as f:
+            f.write(captcha_bytes)
+        return path
+    except Exception as exc:  # noqa: BLE001
+        print(f"[WARN] captcha dump 저장 실패: {exc}")
+        return None
 
 def send_telegram(bot_token: Optional[str], chat_id: Optional[str], msg: str) -> None:
     if not bot_token or not chat_id:
@@ -97,10 +109,34 @@ def send_telegram(bot_token: Optional[str], chat_id: Optional[str], msg: str) ->
 
 
 def js_wait_for_knockout(page: Page, timeout_ms: int = 15000) -> None:
-    page.wait_for_function(
-        """() => typeof ko !== 'undefined' && ko.dataFor(document.body)""",
-        timeout=timeout_ms,
-    )
+    """Wait until Knockout view model is available.
+
+    Avoid Playwright's `wait_for_function` here because some target pages can
+    monkey-patch globals used by Playwright's injected selector runtime,
+    causing runtime errors like `this._engines.set is not a function`.
+    """
+    deadline = time.time() + (timeout_ms / 1000)
+    while time.time() < deadline:
+        try:
+            ready = page.evaluate(
+                """
+                () => {
+                  try {
+                    return typeof ko !== 'undefined' && !!ko.dataFor(document.body);
+                  } catch (e) {
+                    return false;
+                  }
+                }
+                """
+            )
+        except Exception:  # noqa: BLE001
+            ready = False
+
+        if ready:
+            return
+        time.sleep(0.1)
+
+    raise TimeoutError("Knockout view model was not ready in time")
 
 
 def js_change_month_and_select_day(page: Page, target_month: int, target_day: int) -> bool:
@@ -234,16 +270,78 @@ def js_fill_captcha_and_confirm(page: Page, captcha_text: str) -> bool:
 
 
 def wait_and_capture_captcha(page: Page, timeout_ms: int = 10000) -> Optional[bytes]:
-    img = page.locator("div.ex_area img").first
-    try:
-        img.wait_for(state="visible", timeout=timeout_ms)
-    except Exception:  # noqa: BLE001
-        return None
-    try:
-        return img.screenshot(type="png")
-    except Exception:  # noqa: BLE001
-        return None
+    """Capture captcha image bytes without using Playwright locator APIs."""
+    deadline = time.time() + (timeout_ms / 1000)
+    while time.time() < deadline:
+        try:
+            data_url = page.evaluate(
+                """
+                () => {
+                  const img = document.querySelector('div.ex_area img');
+                  if (!img) return null;
+                  const width = img.naturalWidth || img.width;
+                  const height = img.naturalHeight || img.height;
+                  if (!width || !height) return null;
 
+                  const canvas = document.createElement('canvas');
+                  canvas.width = width;
+                  canvas.height = height;
+                  const ctx = canvas.getContext('2d');
+                  if (!ctx) return null;
+                  ctx.drawImage(img, 0, 0, width, height);
+                  return canvas.toDataURL('image/jpeg');
+                }
+                """
+            )
+        except Exception:  # noqa: BLE001
+            data_url = None
+
+        if data_url and isinstance(data_url, str) and data_url.startswith('data:image/jpeg;base64,'):
+            try:
+                return base64.b64decode(data_url.split(',', 1)[1])
+            except Exception:  # noqa: BLE001
+                return None
+
+        time.sleep(0.1)
+
+    return None
+
+
+
+
+def install_js_runtime_guards(context: BrowserContext) -> None:
+    """Guard native constructors from page-side monkey patching.
+
+    Some target pages overwrite built-in constructors (e.g. `Map`/`Set`).
+    Playwright utility scripts rely on these natives while parsing evaluation
+    results, which can trigger errors such as `refs.set is not a function`.
+    """
+    context.add_init_script(
+        """
+        (() => {
+          const g = globalThis;
+          const keep = {
+            Map: g.Map,
+            Set: g.Set,
+            WeakMap: g.WeakMap,
+            WeakSet: g.WeakSet,
+          };
+
+          for (const [name, value] of Object.entries(keep)) {
+            try {
+              Object.defineProperty(g, name, {
+                value,
+                writable: false,
+                configurable: false,
+                enumerable: false,
+              });
+            } catch (e) {
+              // ignore
+            }
+          }
+        })();
+        """
+    )
 
 def ensure_page(context: BrowserContext, cfg: MacroConfig) -> Page:
     page = context.new_page()
@@ -251,12 +349,22 @@ def ensure_page(context: BrowserContext, cfg: MacroConfig) -> Page:
     return page
 
 
+
+
+def is_known_playwright_eval_runtime_error(exc: Exception) -> bool:
+    msg = str(exc)
+    return (
+        "refs.set is not a function" in msg
+        or "this._engines.set is not a function" in msg
+    )
+
 def run_macro(cfg: MacroConfig) -> None:
-    cracker = CaptchaCrackerAdapter()
+    cracker = CaptchaCrackerAdapter(verbose=cfg.verbose, model_path=cfg.captcha_model_path, img_width=cfg.img_width, img_height=cfg.img_height)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=cfg.headless)
         context = browser.new_context()
+        install_js_runtime_guards(context)
         page = ensure_page(context, cfg)
 
         print("[INFO] 로그인 완료 상태를 확인한 뒤 엔터를 누르세요.")
@@ -266,9 +374,13 @@ def run_macro(cfg: MacroConfig) -> None:
 
         while True:
             try:
+                debug_log(cfg, "waiting for knockout view model")
                 js_wait_for_knockout(page)
+                debug_log(cfg, "knockout ready")
 
+                debug_log(cfg, f"select month/day start month={cfg.target_month} day={cfg.target_day}")
                 ok = js_change_month_and_select_day(page, cfg.target_month, cfg.target_day)
+                debug_log(cfg, f"select month/day result={ok}")
                 if not ok:
                     print("[WARN] 날짜 탐색 실패 -> reload")
                     page.reload(wait_until="domcontentloaded")
@@ -277,9 +389,12 @@ def run_macro(cfg: MacroConfig) -> None:
                 time.sleep(0.2)
 
                 if cfg.site_no > 0:
+                    debug_log(cfg, f"fixed site mode area={cfg.area_name} site={cfg.site_no}")
                     ok = js_select_site(page, cfg.area_name, cfg.site_no)
                 else:
+                    debug_log(cfg, "scan mode for available site")
                     ok = js_scan_and_select_available(page)
+                debug_log(cfg, f"site selection result={ok}")
 
                 if not ok:
                     print("[WARN] 사이트 선택 실패 -> reload")
@@ -293,14 +408,21 @@ def run_macro(cfg: MacroConfig) -> None:
                     page.reload(wait_until="domcontentloaded")
                     continue
 
+                debug_log(cfg, "capturing captcha image")
                 captcha_bytes = wait_and_capture_captcha(page)
+                debug_log(cfg, f"captcha bytes captured={0 if not captcha_bytes else len(captcha_bytes)}")
                 if not captcha_bytes:
                     print("[WARN] captcha 이미지 대기 실패 -> reload")
                     page.reload(wait_until="domcontentloaded")
                     continue
 
-                send_telegram(cfg.telegram_bot_token, cfg.telegram_chat_id, "Check Gangdong reservation.")
+                dump_path = dump_captcha_image(captcha_bytes, cfg.captcha_dump_dir)
+                if dump_path:
+                    print(f"[INFO] captcha image saved: {dump_path}")
+
+                debug_log(cfg, "ocr solving start")
                 captcha_text = cracker.solve_bytes(captcha_bytes)
+                debug_log(cfg, f"ocr solving done text_len={len(captcha_text) if captcha_text else 0}")
                 print(f"[INFO] captcha text: {captcha_text}")
 
                 if not captcha_text:
@@ -308,8 +430,11 @@ def run_macro(cfg: MacroConfig) -> None:
                     page.reload(wait_until="domcontentloaded")
                     continue
 
+                debug_log(cfg, "submit captcha text to page")
                 ok = js_fill_captcha_and_confirm(page, captcha_text)
+                debug_log(cfg, f"captcha confirm click result={ok}")
                 if ok:
+                    send_telegram(cfg.telegram_bot_token, cfg.telegram_chat_id, "Check Gangdong reservation.")
                     print("[INFO] captcha 입력 및 confirm 완료")
                     time.sleep(3)
                 else:
@@ -325,38 +450,28 @@ def run_macro(cfg: MacroConfig) -> None:
                 break
             except Exception as exc:  # noqa: BLE001
                 print(f"[WARN] 예외 발생: {exc} -> reload")
+                debug_log(cfg, f"exception type={type(exc).__name__}")
                 try:
-                    page.reload(wait_until="domcontentloaded")
+                    if is_known_playwright_eval_runtime_error(exc):
+                        print("[WARN] Playwright evaluate runtime 오염 감지 -> context 재생성")
+                        context.close()
+                        context = browser.new_context()
+                        install_js_runtime_guards(context)
+                        page = ensure_page(context, cfg)
+                    else:
+                        page.reload(wait_until="domcontentloaded")
                 except Exception:  # noqa: BLE001
+                    context.close()
+                    context = browser.new_context()
+                    install_js_runtime_guards(context)
                     page = ensure_page(context, cfg)
 
         context.close()
         browser.close()
 
-
-def parse_args() -> MacroConfig:
-    parser = argparse.ArgumentParser(description="Gangdong reservation macro (Python)")
-    parser.add_argument("--target-month", type=int, required=True, help="목표 월 (예: 4)")
-    parser.add_argument("--target-day", type=int, required=True, help="목표 일 (예: 19)")
-    parser.add_argument("--area-name", type=int, default=2, help="시설코드 0:가족 1:오토 2:매화")
-    parser.add_argument("--site-no", type=int, default=6, help=">0 고정 사이트, <=0 빈자리 탐색")
-    parser.add_argument("--reload-interval", type=int, default=600, help="주기적 새로고침(초)")
-    parser.add_argument("--headless", action="store_true", help="헤드리스 실행")
-    parser.add_argument("--telegram-bot-token", default=os.getenv("TELEGRAM_BOT_TOKEN"))
-    parser.add_argument("--telegram-chat-id", default=os.getenv("TELEGRAM_CHAT_ID"))
-    args = parser.parse_args()
-
-    return MacroConfig(
-        target_month=args.target_month,
-        target_day=args.target_day,
-        area_name=args.area_name,
-        site_no=args.site_no,
-        reload_interval_s=args.reload_interval,
-        headless=args.headless,
-        telegram_bot_token=args.telegram_bot_token,
-        telegram_chat_id=args.telegram_chat_id,
-    )
-
-
 if __name__ == "__main__":
-    run_macro(parse_args())
+    args = MacroConfig(
+        verbose=True,
+        captcha_model_path="./weights_bw.h5"
+    )
+    run_macro(args)
