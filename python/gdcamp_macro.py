@@ -47,7 +47,7 @@ class MacroConfig:
     verbose: bool = False
     img_width: int = 250
     img_height: int = 85
-
+    captcha_max_attempts_per_reservation: int = 8
 
 
 
@@ -83,7 +83,6 @@ def dump_captcha_image(captcha_bytes: bytes, dump_dir: Optional[str]) -> Optiona
         os.makedirs(dump_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         path = os.path.join(dump_dir, f"captcha_{timestamp}.jpg")
-        cv2.imwrite(path, th)
         with open(path, "wb") as f:
             f.write(captcha_bytes)
         return path
@@ -306,6 +305,17 @@ def wait_and_capture_captcha(page: Page, timeout_ms: int = 10000) -> Optional[by
 
     return None
 
+def dummy_call(page: Page) -> None:
+    page.evaluate(
+        """
+        () => {
+          const img = document.querySelector('div.ex_area img');
+        }
+        """
+    )
+
+    return None
+
 
 
 
@@ -348,6 +358,30 @@ def ensure_page(context: BrowserContext, cfg: MacroConfig) -> Page:
     page.goto(cfg.initial_url, wait_until="domcontentloaded")
     return page
 
+@dataclass
+class DialogTracker:
+    count: int = 0
+    last_message: Optional[str] = None
+    last_seen_at: float = 0.0
+
+
+def bind_dialog_auto_accept(page: Page, tracker: DialogTracker, cfg: MacroConfig) -> None:
+    def _on_dialog(dialog) -> None:
+        tracker.count += 1
+        tracker.last_message = dialog.message
+        tracker.last_seen_at = time.time()
+        debug_log(
+            cfg,
+            f"dialog detected count={tracker.count} message={tracker.last_message} time={tracker.last_seen_at:.3f}"
+        )
+        dialog.accept()
+
+    page.on("dialog", _on_dialog)
+
+
+def has_new_dialog_since(tracker: DialogTracker, submitted_at: float) -> bool:
+    return tracker.last_seen_at >= submitted_at
+
 
 
 
@@ -366,6 +400,8 @@ def run_macro(cfg: MacroConfig) -> None:
         context = browser.new_context()
         install_js_runtime_guards(context)
         page = ensure_page(context, cfg)
+        dialog_tracker = DialogTracker()
+        bind_dialog_auto_accept(page, dialog_tracker, cfg)
 
         print("[INFO] 로그인 완료 상태를 확인한 뒤 엔터를 누르세요.")
         input()
@@ -408,43 +444,75 @@ def run_macro(cfg: MacroConfig) -> None:
                     page.reload(wait_until="domcontentloaded")
                     continue
 
-                debug_log(cfg, "capturing captcha image")
-                captcha_bytes = wait_and_capture_captcha(page)
-                debug_log(cfg, f"captcha bytes captured={0 if not captcha_bytes else len(captcha_bytes)}")
-                if not captcha_bytes:
-                    print("[WARN] captcha 이미지 대기 실패 -> reload")
-                    page.reload(wait_until="domcontentloaded")
-                    continue
+                captcha_solved = False
+                for captcha_attempt in range(1, cfg.captcha_max_attempts_per_reservation + 1):
+                    debug_log(cfg, f"capturing captcha image attempt={captcha_attempt}")
+                    captcha_bytes = wait_and_capture_captcha(page)
+                    debug_log(cfg, f"captcha bytes captured={0 if not captcha_bytes else len(captcha_bytes)}")
+                    if not captcha_bytes:
+                        print("[WARN] captcha 이미지 대기 실패 -> reload")
+                        page.reload(wait_until="domcontentloaded")
+                        break
 
-                dump_path = dump_captcha_image(captcha_bytes, cfg.captcha_dump_dir)
-                if dump_path:
-                    print(f"[INFO] captcha image saved: {dump_path}")
+                    dump_path = dump_captcha_image(captcha_bytes, cfg.captcha_dump_dir)
+                    if dump_path:
+                        print(f"[INFO] captcha image saved: {dump_path}")
 
-                debug_log(cfg, "ocr solving start")
-                captcha_text = cracker.solve_bytes(captcha_bytes)
-                debug_log(cfg, f"ocr solving done text_len={len(captcha_text) if captcha_text else 0}")
-                print(f"[INFO] captcha text: {captcha_text}")
+                    debug_log(cfg, "ocr solving start")
+                    captcha_text = cracker.solve_bytes(captcha_bytes)
+                    debug_log(cfg, f"ocr solving done text_len={len(captcha_text) if captcha_text else 0}")
+                    print(f"[INFO] captcha text: {captcha_text}")
 
-                if not captcha_text:
-                    print("[WARN] captcha OCR empty -> reload")
-                    page.reload(wait_until="domcontentloaded")
-                    continue
+                    if not captcha_text:
+                        print("[WARN] captcha OCR empty -> 다음 captcha 재시도")
+                        continue
 
-                debug_log(cfg, "submit captcha text to page")
-                ok = js_fill_captcha_and_confirm(page, captcha_text)
-                debug_log(cfg, f"captcha confirm click result={ok}")
-                if ok:
+                    submitted_at = time.time()
+                    print(f"function call time: {submitted_at}")
+                    debug_log(cfg, "submit captcha text to page")
+                    ok = js_fill_captcha_and_confirm(page, captcha_text)
+                    print(f"submitted time: {time.time()}")
+                    debug_log(cfg, f"captcha confirm click result={ok}")
+                    if not ok:
+                        print("[WARN] captcha confirm 실패 -> reload")
+                        page.reload(wait_until="domcontentloaded")
+                        break
+
+                    # 오답이면 alert(dialog) 발생 후 페이지가 새 captcha를 제공함.
+                    max_wait = 2.0
+                    start_wait = time.time()
+                    detected = False
+                    while time.time() - start_wait < max_wait:
+                        dummy_call(page)
+                        if has_new_dialog_since(dialog_tracker, submitted_at):
+                            detected = True
+                            break
+                        time.sleep(0.1)
+
+
+#                    time.sleep(0.5)
+#                    print(submitted_at, dialog_tracker.last_seen_at)
+#                    if has_new_dialog_since(dialog_tracker, submitted_at):
+                    print(submitted_at, dialog_tracker.last_seen_at)
+                    if detected:
+                        print(f"[WARN] captcha 오답 alert 감지 -> 재시도 (msg: {dialog_tracker.last_message})")
+                        continue
+
+                    """
                     send_telegram(cfg.telegram_bot_token, cfg.telegram_chat_id, "Check Gangdong reservation.")
                     print("[INFO] captcha 입력 및 confirm 완료")
                     time.sleep(3)
-                else:
-                    print("[WARN] captcha confirm 실패 -> reload")
-                    page.reload(wait_until="domcontentloaded")
+                    captcha_solved = True
+                    break
+                    """
+
+                if not captcha_solved:
+                    print("[WARN] captcha 최대 재시도 초과 또는 처리 실패 -> 메인 루프 재시작")
+                    continue
 
                 if time.time() - last_reload > cfg.reload_interval_s:
                     page.reload(wait_until="domcontentloaded")
                     last_reload = time.time()
-
             except KeyboardInterrupt:
                 print("[INFO] 사용자 중단")
                 break
@@ -458,6 +526,8 @@ def run_macro(cfg: MacroConfig) -> None:
                         context = browser.new_context()
                         install_js_runtime_guards(context)
                         page = ensure_page(context, cfg)
+                        dialog_tracker = DialogTracker()
+                        bind_dialog_auto_accept(page, dialog_tracker, cfg)
                     else:
                         page.reload(wait_until="domcontentloaded")
                 except Exception:  # noqa: BLE001
@@ -465,6 +535,8 @@ def run_macro(cfg: MacroConfig) -> None:
                     context = browser.new_context()
                     install_js_runtime_guards(context)
                     page = ensure_page(context, cfg)
+                    dialog_tracker = DialogTracker()
+                    bind_dialog_auto_accept(page, dialog_tracker, cfg)
 
         context.close()
         browser.close()
