@@ -27,9 +27,8 @@ from typing import Optional
 from playwright.sync_api import BrowserContext, Page, sync_playwright
 
 import cv2
-import CaptchaCracker as cc
 import numpy as np
-
+from digit_ocr import load_digit_model, predict_digit_string
 
 
 @dataclass
@@ -38,7 +37,7 @@ class MacroConfig:
     target_day: int = 25
     area_name: int = 2 # 0: family, 1: auto, 2: plum
     site_no: int = 0   # >0 fixed seat, <=0 scan for available
-    reload_interval_s: int = 600
+    reload_interval_s: int = 30
     initial_url: str = "https://camp.xticket.kr/web/main?shopEncode=5f9422e223671b122a7f2c94f4e15c6f71cd1a49141314cf19adccb98162b5b0"
     headless: bool = False
     telegram_bot_token: Optional[str] = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -57,24 +56,47 @@ def debug_log(cfg: Optional[MacroConfig], message: str) -> None:
         print(f"[DEBUG] {message}")
 
 class CaptchaCrackerAdapter:
-    def __init__(self, verbose: bool = False, model_path: str = None, img_width: int = 250, img_height: int = 85, max_length: int = 4, target_char: list = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9'}) -> None:
+    def __init__(self, verbose: bool = False, model_path: str = None, max_length: int = 4) -> None:
         self._verbose = verbose
-        self._AM = cc.ApplyModel(model_path, img_width, img_height, max_length, target_char)
-        print(self._AM.predict("./0005.jpg"))
+        self._AM = load_digit_model(model_path)
+        self._max_length = max_length
 
     def _log(self, msg: str) -> None:
         if self._verbose:
             print(f"[DEBUG][OCR] {msg}")
 
-    def solve_bytes(self, image_bytes: str) -> str:
+    def solve_bytes(self, image_bytes: bytes) -> str:
         self._log(f"solve_bytes start size={len(image_bytes)}")
+        if not image_bytes:
+            return ""
 
-        img_array = np.frombuffer(image_bytes, dtype=np.uint8)
-        img = cv2.imdecode(img_array, cv2.IMREAD_GRAYSCALE)
-        _, th = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-        cv2.imwrite("./tmp.jpg", th)
-        text = self._AM.predict("./tmp.jpg")
-        return text
+        try:
+            result = predict_digit_string(
+                image_bytes=image_bytes,
+                digit_count=self._max_length,
+                model=self._AM,
+            )
+            text = result.text
+#            text = self._AM.predict_from_bytes(image_bytes)
+        except Exception as exc:  # noqa: BLE001
+            self._log(f"predict_from_bytes failed: {exc}")
+            return ""
+
+        normalized = re.sub(r"\D", "", str(text or ""))
+        self._log(f"solve_bytes result raw={text!r} normalized={normalized!r}")
+        return normalized
+
+
+def guess_image_extension(image_bytes: bytes) -> str:
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if image_bytes.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if image_bytes.startswith((b"GIF87a", b"GIF89a")):
+        return ".gif"
+    if image_bytes.startswith(b"RIFF") and image_bytes[8:12] == b"WEBP":
+        return ".webp"
+    return ".bin"
 
 
 def dump_captcha_image(captcha_bytes: bytes, dump_dir: Optional[str]) -> Optional[str]:
@@ -83,7 +105,8 @@ def dump_captcha_image(captcha_bytes: bytes, dump_dir: Optional[str]) -> Optiona
     try:
         os.makedirs(dump_dir, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        path = os.path.join(dump_dir, f"captcha_{timestamp}.jpg")
+        ext = guess_image_extension(captcha_bytes)
+        path = os.path.join(dump_dir, f"captcha_{timestamp}{ext}")
         with open(path, "wb") as f:
             f.write(captcha_bytes)
         return path
@@ -197,8 +220,9 @@ def js_select_site(page: Page, area_name: int, site_no: int) -> bool:
 
 
 def js_scan_and_select_available(page: Page, max_cycles: int = 300) -> bool:
-    for _ in range(max_cycles):
-        area_code = random.randint(1, 3)
+    for idx in range(max_cycles):
+        area_code = idx%3+1
+#        area_code = random.randint(1, 3)
         selected = bool(
             page.evaluate(
                 """
@@ -233,7 +257,7 @@ def js_scan_and_select_available(page: Page, max_cycles: int = 300) -> bool:
         )
         if selected:
             return True
-        time.sleep(0.1 + random.random() * 0.2)
+        time.sleep(0.1 + random.random() * 0.1)
     return False
 
 
@@ -273,6 +297,7 @@ def wait_and_capture_captcha(
     page: Page,
     timeout_ms: int = 10000,
     previous_signature: Optional[str] = None,
+    min_bytes: int = 200,
 ) -> tuple[Optional[bytes], Optional[str]]:
     """Capture captcha image bytes without Playwright locator APIs.
 
@@ -291,6 +316,14 @@ def wait_and_capture_captcha(
                   let target = null;
                   let bestArea = 0;
                   candidates.forEach((img) => {
+                    const style = window.getComputedStyle(img);
+                    const visible =
+                        style.display !== 'none' &&
+                        style.visibility !== 'hidden' &&
+                        Number(style.opacity || '1') > 0 &&
+                        (img.offsetWidth > 0 || img.offsetHeight > 0);
+                    if (!visible || !img.complete) return;
+
                     const width = img.naturalWidth || img.width || 0;
                     const height = img.naturalHeight || img.height || 0;
                     const area = width * height;
@@ -312,10 +345,10 @@ def wait_and_capture_captcha(
                   if (!ctx) return null;
                   ctx.drawImage(target, 0, 0, width, height);
                   return {
-                    dataUrl: canvas.toDataURL('image/jpeg'),
+                    dataUrl: canvas.toDataURL('image/png'),
                     width,
                     height,
-                    src: target.getAttribute('src') || '',
+                    src: target.currentSrc || target.getAttribute('src') || '',
                   };
                 }
                 """
@@ -324,14 +357,29 @@ def wait_and_capture_captcha(
             capture = None
 
         data_url = capture.get('dataUrl') if isinstance(capture, dict) else None
-        if data_url and isinstance(data_url, str) and data_url.startswith('data:image/jpeg;base64,'):
-            signature = sha1(data_url.encode('utf-8')).hexdigest()
-            if previous_signature and signature == previous_signature:
-                time.sleep(0.1)
-                continue
-
+        if data_url and isinstance(data_url, str) and data_url.startswith('data:image/') and ';base64,' in data_url:
             try:
                 image_bytes = base64.b64decode(data_url.split(',', 1)[1])
+                signature = sha1(image_bytes).hexdigest()
+                if previous_signature and signature == previous_signature:
+                    time.sleep(0.1)
+                    continue
+
+                if len(image_bytes) < min_bytes:
+                    time.sleep(0.1)
+                    continue
+
+                img_array = np.frombuffer(image_bytes, dtype=np.uint8)
+                decoded = cv2.imdecode(img_array, cv2.IMREAD_GRAYSCALE)
+                if decoded is None:
+                    time.sleep(0.1)
+                    continue
+
+                height, width = decoded.shape[:2]
+                if width < 80 or height < 20:
+                    time.sleep(0.1)
+                    continue
+
                 return image_bytes, signature
 
             except Exception:  # noqa: BLE001
@@ -429,7 +477,7 @@ def is_known_playwright_eval_runtime_error(exc: Exception) -> bool:
     )
 
 def run_macro(cfg: MacroConfig) -> None:
-    cracker = CaptchaCrackerAdapter(verbose=cfg.verbose, model_path=cfg.captcha_model_path, img_width=cfg.img_width, img_height=cfg.img_height)
+    cracker = CaptchaCrackerAdapter(verbose=cfg.verbose, model_path=cfg.captcha_model_path)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=cfg.headless)
@@ -508,10 +556,8 @@ def run_macro(cfg: MacroConfig) -> None:
                         continue
 
                     submitted_at = time.time()
-                    print(f"function call time: {submitted_at}")
                     debug_log(cfg, "submit captcha text to page")
                     ok = js_fill_captcha_and_confirm(page, captcha_text)
-                    print(f"submitted time: {time.time()}")
                     debug_log(cfg, f"captcha confirm click result={ok}")
                     if not ok:
                         print("[WARN] captcha confirm 실패 -> reload")
@@ -536,7 +582,6 @@ def run_macro(cfg: MacroConfig) -> None:
                         continue
 
 
-                    send_telegram(cfg.telegram_bot_token, cfg.telegram_chat_id, "Check Gangdong reservation.")
                     print("[INFO] captcha 입력 및 confirm 완료")
                     time.sleep(3)
                     captcha_solved = True
@@ -545,6 +590,10 @@ def run_macro(cfg: MacroConfig) -> None:
                 if not captcha_solved:
                     print("[WARN] captcha 최대 재시도 초과 또는 처리 실패 -> 메인 루프 재시작")
                     continue
+                else:
+                    send_telegram(cfg.telegram_bot_token, cfg.telegram_chat_id, "Check Gangdong reservation.")
+                    print("[INFO] 예약 성공")
+                    break
 
                 if time.time() - last_reload > cfg.reload_interval_s:
                     page.reload(wait_until="domcontentloaded")
@@ -580,6 +629,7 @@ def run_macro(cfg: MacroConfig) -> None:
 if __name__ == "__main__":
     args = MacroConfig(
         verbose=True,
-        captcha_model_path="./weights_bw.h5"
+        captcha_model_path="./models/digit_ocr_model.npz",
+        captcha_dump_dir="./"
     )
     run_macro(args)
