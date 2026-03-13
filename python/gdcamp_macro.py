@@ -20,6 +20,7 @@ import random
 import re
 import time
 from datetime import datetime
+from hashlib import sha1
 from dataclasses import dataclass
 from typing import Optional
 
@@ -268,42 +269,77 @@ def js_fill_captcha_and_confirm(page: Page, captcha_text: str) -> bool:
     )
 
 
-def wait_and_capture_captcha(page: Page, timeout_ms: int = 10000) -> Optional[bytes]:
-    """Capture captcha image bytes without using Playwright locator APIs."""
+def wait_and_capture_captcha(
+    page: Page,
+    timeout_ms: int = 10000,
+    previous_signature: Optional[str] = None,
+) -> tuple[Optional[bytes], Optional[str]]:
+    """Capture captcha image bytes without Playwright locator APIs.
+
+    Returns image bytes and signature. If `previous_signature` is provided,
+    waits for a different captcha image before returning.
+    """
     deadline = time.time() + (timeout_ms / 1000)
     while time.time() < deadline:
         try:
-            data_url = page.evaluate(
+            capture = page.evaluate(
                 """
                 () => {
-                  const img = document.querySelector('div.ex_area img');
-                  if (!img) return null;
-                  const width = img.naturalWidth || img.width;
-                  const height = img.naturalHeight || img.height;
-                  if (!width || !height) return null;
+                  const candidates = Array.from(document.querySelectorAll('div.ex_area img'));
+                  if (!candidates.length) return null;
+
+                  let target = null;
+                  let bestArea = 0;
+                  candidates.forEach((img) => {
+                    const width = img.naturalWidth || img.width || 0;
+                    const height = img.naturalHeight || img.height || 0;
+                    const area = width * height;
+                    if (area > bestArea) {
+                      bestArea = area;
+                      target = img;
+                    }
+                  });
+
+                  if (!target) return null;
+                  const width = target.naturalWidth || target.width;
+                  const height = target.naturalHeight || target.height;
+                  if (!width || !height || width < 80 || height < 20) return null;
 
                   const canvas = document.createElement('canvas');
                   canvas.width = width;
                   canvas.height = height;
                   const ctx = canvas.getContext('2d');
                   if (!ctx) return null;
-                  ctx.drawImage(img, 0, 0, width, height);
-                  return canvas.toDataURL('image/jpeg');
+                  ctx.drawImage(target, 0, 0, width, height);
+                  return {
+                    dataUrl: canvas.toDataURL('image/jpeg'),
+                    width,
+                    height,
+                    src: target.getAttribute('src') || '',
+                  };
                 }
                 """
             )
         except Exception:  # noqa: BLE001
-            data_url = None
+            capture = None
 
+        data_url = capture.get('dataUrl') if isinstance(capture, dict) else None
         if data_url and isinstance(data_url, str) and data_url.startswith('data:image/jpeg;base64,'):
+            signature = sha1(data_url.encode('utf-8')).hexdigest()
+            if previous_signature and signature == previous_signature:
+                time.sleep(0.1)
+                continue
+
             try:
-                return base64.b64decode(data_url.split(',', 1)[1])
+                image_bytes = base64.b64decode(data_url.split(',', 1)[1])
+                return image_bytes, signature
+
             except Exception:  # noqa: BLE001
-                return None
+                return None, None
 
         time.sleep(0.1)
 
-    return None
+    return None, None
 
 def dummy_call(page: Page) -> None:
     page.evaluate(
@@ -445,9 +481,13 @@ def run_macro(cfg: MacroConfig) -> None:
                     continue
 
                 captcha_solved = False
+                last_captcha_signature: Optional[str] = None
                 for captcha_attempt in range(1, cfg.captcha_max_attempts_per_reservation + 1):
                     debug_log(cfg, f"capturing captcha image attempt={captcha_attempt}")
-                    captcha_bytes = wait_and_capture_captcha(page)
+                    captcha_bytes, captcha_signature = wait_and_capture_captcha(
+                        page,
+                        previous_signature=last_captcha_signature,
+                    )
                     debug_log(cfg, f"captcha bytes captured={0 if not captcha_bytes else len(captcha_bytes)}")
                     if not captcha_bytes:
                         print("[WARN] captcha 이미지 대기 실패 -> reload")
@@ -490,21 +530,17 @@ def run_macro(cfg: MacroConfig) -> None:
                         time.sleep(0.1)
 
 
-#                    time.sleep(0.5)
-#                    print(submitted_at, dialog_tracker.last_seen_at)
-#                    if has_new_dialog_since(dialog_tracker, submitted_at):
-                    print(submitted_at, dialog_tracker.last_seen_at)
+                    last_captcha_signature = captcha_signature
                     if detected:
                         print(f"[WARN] captcha 오답 alert 감지 -> 재시도 (msg: {dialog_tracker.last_message})")
                         continue
 
-                    """
+
                     send_telegram(cfg.telegram_bot_token, cfg.telegram_chat_id, "Check Gangdong reservation.")
                     print("[INFO] captcha 입력 및 confirm 완료")
                     time.sleep(3)
                     captcha_solved = True
                     break
-                    """
 
                 if not captcha_solved:
                     print("[WARN] captcha 최대 재시도 초과 또는 처리 실패 -> 메인 루프 재시작")
