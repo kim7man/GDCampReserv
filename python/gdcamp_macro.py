@@ -33,20 +33,18 @@ from digit_ocr import load_digit_model, predict_digit_string
 
 @dataclass
 class MacroConfig:
-    target_month: int = 4
-    target_day: int = 25
+    target_month: int = 3
+    target_day: int = 26
     area_name: int = 2 # 0: family, 1: auto, 2: plum
     site_no: int = 0   # >0 fixed seat, <=0 scan for available
-    reload_interval_s: int = 30
+    reload_interval_s: int = 600
     initial_url: str = "https://camp.xticket.kr/web/main?shopEncode=5f9422e223671b122a7f2c94f4e15c6f71cd1a49141314cf19adccb98162b5b0"
     headless: bool = False
-    telegram_bot_token: Optional[str] = os.getenv("TELEGRAM_BOT_TOKEN")
-    telegram_chat_id: Optional[str] = os.getenv("TELEGRAM_CHAT_ID")
+    telegram_bot_token: Optional[str] = None
+    telegram_chat_id: Optional[str] = None
     captcha_dump_dir: Optional[str] = None
     captcha_model_path: str = None
     verbose: bool = False
-    img_width: int = 250
-    img_height: int = 85
     captcha_max_attempts_per_reservation: int = 8
 
 
@@ -58,6 +56,7 @@ def debug_log(cfg: Optional[MacroConfig], message: str) -> None:
 class CaptchaCrackerAdapter:
     def __init__(self, verbose: bool = False, model_path: str = None, max_length: int = 4) -> None:
         self._verbose = verbose
+        self._log(f"load model={model_path}")
         self._AM = load_digit_model(model_path)
         self._max_length = max_length
 
@@ -195,6 +194,107 @@ def js_change_month_and_select_day(page: Page, target_month: int, target_day: in
     )
 
 
+def js_ensure_month_and_day_selected(page: Page, target_month: int, target_day: int) -> bool:
+    return bool(
+        page.evaluate(
+            """
+            ({targetMonth, targetDay}) => {
+              function pad(str, max){
+                str = String(str);
+                return str.length < max ? pad("0" + str, max) : str;
+              }
+              function readObservable(value) {
+                return typeof value === 'function' ? value() : value;
+              }
+              function isSelectedValue(value) {
+                return value === true || value === '1' || value === 1 || value === 'Y' || value === 'y';
+              }
+
+              const vm = ko.dataFor(document.body);
+              if (!vm || !vm.currentMonth || !vm.monthCalendar || !vm.clickBookDate) return false;
+
+              const expectedMonth = String(new Date().getFullYear()) + pad(targetMonth, 2);
+              const currentMonth = String(readObservable(vm.currentMonth) ?? "");
+
+              let found = null;
+              let daySelected = false;
+
+              vm.monthCalendar().forEach((week) => {
+                week().forEach((day) => {
+                  const dayValue = day();
+                  if (pad(dayValue.dateLabel, 2) !== pad(targetDay, 2)) return;
+                  found = day;
+
+                  if (
+                    isSelectedValue(dayValue.select_yn) ||
+                    isSelectedValue(dayValue.choice_yn) ||
+                    isSelectedValue(dayValue.selected) ||
+                    isSelectedValue(dayValue.isSelected) ||
+                    isSelectedValue(dayValue.active)
+                  ) {
+                    daySelected = true;
+                  }
+                });
+              });
+
+              const selectedDateCandidates = [
+                vm.currentBookDate,
+                vm.currentDate,
+                vm.selectedDate,
+                vm.selectedBookDate,
+              ];
+
+              for (const candidate of selectedDateCandidates) {
+                const value = readObservable(candidate);
+                if (value == null) continue;
+
+                if (typeof value === 'object') {
+                  if (pad(value.dateLabel, 2) === pad(targetDay, 2)) {
+                    daySelected = true;
+                    break;
+                  }
+                  continue;
+                }
+
+                const text = String(value);
+                if (
+                  text === String(targetDay) ||
+                  text === pad(targetDay, 2) ||
+                  text.endsWith(`-${pad(targetMonth, 2)}-${pad(targetDay, 2)}`) ||
+                  text.endsWith(`/${pad(targetMonth, 2)}/${pad(targetDay, 2)}`) ||
+                  text.endsWith(`${pad(targetMonth, 2)}${pad(targetDay, 2)}`)
+                ) {
+                  daySelected = true;
+                  break;
+                }
+              }
+
+              if (currentMonth === expectedMonth && daySelected) {
+                return true;
+              }
+
+              vm.currentMonth(expectedMonth);
+
+              found = null;
+              vm.monthCalendar().forEach((week) => {
+                week().forEach((day) => {
+                  const dayValue = day();
+                  if (pad(dayValue.dateLabel, 2) === pad(targetDay, 2)) {
+                    found = day;
+                  }
+                });
+              });
+
+              if (!found) return false;
+              vm.clickBookDate(found());
+              return true;
+            }
+            """,
+            {"targetMonth": target_month, "targetDay": target_day},
+        )
+    )
+
+
 def js_select_site(page: Page, area_name: int, site_no: int) -> bool:
     return bool(
         page.evaluate(
@@ -219,8 +319,12 @@ def js_select_site(page: Page, area_name: int, site_no: int) -> bool:
     )
 
 
-def js_scan_and_select_available(page: Page, max_cycles: int = 300) -> bool:
+def js_scan_and_select_available(page: Page, target_month: int, target_day: int, max_cycles: int = 300) -> bool:
     for idx in range(max_cycles):
+        if not js_ensure_month_and_day_selected(page, target_month, target_day):
+            time.sleep(0.2 + random.random() * 0.1)
+            continue
+
         area_code = idx%3+1
 #        area_code = random.randint(1, 3)
         selected = bool(
@@ -257,7 +361,7 @@ def js_scan_and_select_available(page: Page, max_cycles: int = 300) -> bool:
         )
         if selected:
             return True
-        time.sleep(0.1 + random.random() * 0.1)
+        time.sleep(0.2 + random.random() * 0.1)
     return False
 
 
@@ -513,7 +617,7 @@ def run_macro(cfg: MacroConfig) -> None:
                     ok = js_select_site(page, cfg.area_name, cfg.site_no)
                 else:
                     debug_log(cfg, "scan mode for available site")
-                    ok = js_scan_and_select_available(page)
+                    ok = js_scan_and_select_available(page, cfg.target_month, cfg.target_day)
                 debug_log(cfg, f"site selection result={ok}")
 
                 if not ok:
@@ -626,10 +730,47 @@ def run_macro(cfg: MacroConfig) -> None:
         context.close()
         browser.close()
 
+
+'''
 if __name__ == "__main__":
     args = MacroConfig(
-        verbose=True,
-        captcha_model_path="./models/digit_ocr_model.npz",
-        captcha_dump_dir="./"
+#        verbose=True,
+#        captcha_model_path="./models/digit_ocr_model.npz",
+#        captcha_dump_dir="./"
     )
     run_macro(args)
+'''
+
+def parse_args() -> MacroConfig:
+    parser = argparse.ArgumentParser(description="Gangdong reservation macro (Python)")
+    parser.add_argument("--target-month", type=int, default=3, help="목표 월 (예: 4)")
+    parser.add_argument("--target-day", type=int, default=28, help="목표 일 (예: 19)")
+    parser.add_argument("--area-name", type=int, default=2, help="시설코드 0:가족 1:오토 2:매화")
+    parser.add_argument("--site-no", type=int, default=6, help=">0 고정 사이트, <=0 빈자리 탐색")
+    parser.add_argument("--reload-interval", type=int, default=600, help="주기적 새로고침(초)")
+    parser.add_argument("--headless", action="store_true", help="헤드리스 실행")
+    parser.add_argument("--telegram-bot-token", type=str, default=os.getenv("TELEGRAM_BOT_TOKEN"))
+    parser.add_argument("--telegram-chat-id", type=str, default=os.getenv("TELEGRAM_CHAT_ID"))
+    parser.add_argument("--captcha-model-path", type=str, default=os.getenv("CAPTCHA_MODEL_PATH"))
+    parser.add_argument("--captcha-dump-path", type=str, default=None)
+    parser.add_argument("--max-attempts", type=int, default=8)
+    parser.add_argument("--verbose", type=bool, default=False)
+    args = parser.parse_args()
+
+    return MacroConfig(
+        target_month=args.target_month,
+        target_day=args.target_day,
+        area_name=args.area_name,
+        site_no=args.site_no,
+        reload_interval_s=args.reload_interval,
+        headless=args.headless,
+        telegram_bot_token=args.telegram_bot_token,
+        telegram_chat_id=args.telegram_chat_id,
+        captcha_model_path = args.captcha_model_path,
+        captcha_max_attempts_per_reservation = args.max_attempts,
+        verbose = args.verbose
+    )
+
+
+if __name__ == "__main__":
+    run_macro(parse_args())
