@@ -598,6 +598,10 @@ def run_macro(cfg: MacroConfig) -> None:
 
         while True:
             try:
+                if time.time() - last_reload > cfg.reload_interval_s:
+                    page.reload(wait_until="domcontentloaded")
+                    last_reload = time.time()
+
                 debug_log(cfg, "waiting for knockout view model")
                 js_wait_for_knockout(page)
                 debug_log(cfg, "knockout ready")
@@ -607,6 +611,7 @@ def run_macro(cfg: MacroConfig) -> None:
                 debug_log(cfg, f"select month/day result={ok}")
                 if not ok:
                     print("[WARN] 날짜 탐색 실패 -> reload")
+                    last_reload = time.time()
                     page.reload(wait_until="domcontentloaded")
                     continue
 
@@ -621,7 +626,8 @@ def run_macro(cfg: MacroConfig) -> None:
                 debug_log(cfg, f"site selection result={ok}")
 
                 if not ok:
-                    print("[WARN] 사이트 선택 실패 -> reload")
+                    print("[WARN] 빈 자리 확인 불가 -> reload")
+                    last_reload = time.time()
                     page.reload(wait_until="domcontentloaded")
                     continue
 
@@ -629,6 +635,7 @@ def run_macro(cfg: MacroConfig) -> None:
 
                 if not js_click_reservation(page):
                     print("[WARN] 예약 클릭 실패 -> reload")
+                    last_reload = time.time()
                     page.reload(wait_until="domcontentloaded")
                     continue
 
@@ -643,6 +650,7 @@ def run_macro(cfg: MacroConfig) -> None:
                     debug_log(cfg, f"captcha bytes captured={0 if not captcha_bytes else len(captcha_bytes)}")
                     if not captcha_bytes:
                         print("[WARN] captcha 이미지 대기 실패 -> reload")
+                        last_reload = time.time()
                         page.reload(wait_until="domcontentloaded")
                         break
 
@@ -665,6 +673,7 @@ def run_macro(cfg: MacroConfig) -> None:
                     debug_log(cfg, f"captcha confirm click result={ok}")
                     if not ok:
                         print("[WARN] captcha confirm 실패 -> reload")
+                        last_reload = time.time()
                         page.reload(wait_until="domcontentloaded")
                         break
 
@@ -699,9 +708,6 @@ def run_macro(cfg: MacroConfig) -> None:
                     print("[INFO] 예약 성공")
                     break
 
-                if time.time() - last_reload > cfg.reload_interval_s:
-                    page.reload(wait_until="domcontentloaded")
-                    last_reload = time.time()
             except KeyboardInterrupt:
                 print("[INFO] 사용자 중단")
                 break
@@ -718,6 +724,7 @@ def run_macro(cfg: MacroConfig) -> None:
                         dialog_tracker = DialogTracker()
                         bind_dialog_auto_accept(page, dialog_tracker, cfg)
                     else:
+                        last_reload = time.time()
                         page.reload(wait_until="domcontentloaded")
                 except Exception:  # noqa: BLE001
                     context.close()
@@ -766,9 +773,9 @@ def parse_args() -> MacroConfig:
         headless=args.headless,
         telegram_bot_token=args.telegram_bot_token,
         telegram_chat_id=args.telegram_chat_id,
-        captcha_model_path = args.captcha_model_path,
-        captcha_max_attempts_per_reservation = args.max_attempts,
-        verbose = args.verbose
+        captcha_model_path=args.captcha_model_path,
+        captcha_max_attempts_per_reservation=args.max_attempts,
+        verbose=args.verbose
     )
 
 
