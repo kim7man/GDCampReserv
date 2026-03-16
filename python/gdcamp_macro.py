@@ -162,7 +162,7 @@ def find_best_captcha_locator(page: Page, min_width: int = 80, min_height: int =
 
     return best_locator
 
-class CaptchaCrackerAdapter:
+class CaptchaSolver:
     def __init__(self, verbose: bool = False, model_path: str = None, max_length: int = 4) -> None:
         self._verbose = verbose
         self._log(f"load model={model_path}")
@@ -306,7 +306,7 @@ def js_change_month_and_select_day(page: Page, target_month: int, target_day: in
 
 
 def js_ensure_month_and_day_selected(page: Page, target_month: int, target_day: int) -> bool:
-    return bool(
+    day_selected = int(
         evaluate_body(
             page,
             """
@@ -338,51 +338,16 @@ def js_ensure_month_and_day_selected(page: Page, target_month: int, target_day: 
                   found = day;
 
                   if (
-                    isSelectedValue(dayValue.select_yn) ||
-                    isSelectedValue(dayValue.choice_yn) ||
-                    isSelectedValue(dayValue.selected) ||
-                    isSelectedValue(dayValue.isSelected) ||
-                    isSelectedValue(dayValue.active)
+                    isSelectedValue(dayValue.selected) &&
+                    isSelectedValue(dayValue.bookDay)
                   ) {
                     daySelected = true;
                   }
                 });
               });
 
-              const selectedDateCandidates = [
-                vm.currentBookDate,
-                vm.currentDate,
-                vm.selectedDate,
-                vm.selectedBookDate,
-              ];
-
-              for (const candidate of selectedDateCandidates) {
-                const value = readObservable(candidate);
-                if (value == null) continue;
-
-                if (typeof value === 'object') {
-                  if (pad(value.dateLabel, 2) === pad(targetDay, 2)) {
-                    daySelected = true;
-                    break;
-                  }
-                  continue;
-                }
-
-                const text = String(value);
-                if (
-                  text === String(targetDay) ||
-                  text === pad(targetDay, 2) ||
-                  text.endsWith(`-${pad(targetMonth, 2)}-${pad(targetDay, 2)}`) ||
-                  text.endsWith(`/${pad(targetMonth, 2)}/${pad(targetDay, 2)}`) ||
-                  text.endsWith(`${pad(targetMonth, 2)}${pad(targetDay, 2)}`)
-                ) {
-                  daySelected = true;
-                  break;
-                }
-              }
-
               if (currentMonth === expectedMonth && daySelected) {
-                return true;
+                return 1;
               }
 
               vm.currentMonth(expectedMonth);
@@ -391,20 +356,27 @@ def js_ensure_month_and_day_selected(page: Page, target_month: int, target_day: 
               vm.monthCalendar().forEach((week) => {
                 week().forEach((day) => {
                   const dayValue = day();
-                  if (pad(dayValue.dateLabel, 2) === pad(targetDay, 2)) {
-                    found = day;
+                  if (day().bookDay) {
+                    if (pad(dayValue.dateLabel, 2) === pad(targetDay, 2)) {
+                      found = day;
+                    }
                   }
                 });
               });
 
               if (!found) return false;
               vm.clickBookDate(found());
-              return true;
+              return 2;
             }
             """,
             {"targetMonth": target_month, "targetDay": target_day},
         )
     )
+
+    if day_selected is not None:
+        #print(day_selected)
+        return bool(day_selected)
+    else: return False
 
 
 def js_select_site(page: Page, area_name: int, site_no: int) -> bool:
@@ -435,8 +407,10 @@ def js_select_site(page: Page, area_name: int, site_no: int) -> bool:
 def js_scan_and_select_available(page: Page, target_month: int, target_day: int, max_cycles: int = 300) -> bool:
     for idx in range(max_cycles):
         if not js_ensure_month_and_day_selected(page, target_month, target_day):
-            time.sleep(0.2 + random.random() * 0.1)
-            continue
+            return False
+            #time.sleep(0.2 + random.random() * 0.1)
+            #page.reload(wait_until="domcontentloaded")
+            #continue
 
         area_code = idx%3+1
 #        area_code = random.randint(1, 3)
@@ -673,7 +647,7 @@ def is_known_playwright_eval_runtime_error(exc: Exception) -> bool:
     )
 
 def run_macro(cfg: MacroConfig) -> None:
-    cracker = CaptchaCrackerAdapter(verbose=cfg.verbose, model_path=cfg.captcha_model_path)
+    cracker = CaptchaSolver(verbose=cfg.verbose, model_path=cfg.captcha_model_path)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=cfg.headless)
