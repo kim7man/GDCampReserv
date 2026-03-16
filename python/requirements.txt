@@ -5,3 +5,4 @@ numpy<2.0
 keras<2.11
 pillow
 tensorflow<2.11
+dotenv

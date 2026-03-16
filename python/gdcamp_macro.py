@@ -13,7 +13,6 @@ Flow parity goals:
 from __future__ import annotations
 
 import argparse
-import base64
 import inspect
 import os
 import random
@@ -22,13 +21,44 @@ import time
 from datetime import datetime
 from hashlib import sha1
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional, Sequence
+from dotenv import load_dotenv
+load_dotenv()
 
-from playwright.sync_api import BrowserContext, Page, sync_playwright
+from playwright.sync_api import BrowserContext, Locator, Page, sync_playwright
 
 import cv2
 import numpy as np
 from digit_ocr import load_digit_model, predict_digit_string
+
+BODY_SELECTOR = "body"
+CAPTCHA_IMAGE_SELECTOR = "div.ex_area img"
+LOGIN_ID_SELECTOR = "input#login_id"
+LOGIN_PASSWORD_SELECTOR = "input#login_passwd"
+LOGIN_TRIGGER_SELECTORS = (
+    "button[type='submit']",
+    "input[type='submit']",
+    "button:has-text('로그인')",
+    "a:has-text('로그인')",
+)
+RESERVATION_TRIGGER_SELECTORS = (
+    "button:has-text('예약하기')",
+    "a:has-text('예약하기')",
+    "button:has-text('예약')",
+    "a:has-text('예약')",
+)
+CAPTCHA_INPUT_SELECTORS = (
+    "input[name='captcha']",
+    "input#captcha",
+    "input[id*='captcha']",
+    "input[name*='captcha']",
+)
+CAPTCHA_CONFIRM_SELECTORS = (
+    "button:has-text('확인')",
+    "a:has-text('확인')",
+    "button:has-text('예약확정')",
+    "a:has-text('예약확정')",
+)
 
 
 @dataclass
@@ -46,12 +76,91 @@ class MacroConfig:
     captcha_model_path: str = None
     verbose: bool = False
     captcha_max_attempts_per_reservation: int = 8
+    login_id: Optional[str] = None
+    login_pw: Optional[str] = None
 
 
 
 def debug_log(cfg: Optional[MacroConfig], message: str) -> None:
     if cfg is not None and cfg.verbose:
         print(f"[DEBUG] {message}")
+
+
+def body_locator(page: Page) -> Locator:
+    return page.locator(BODY_SELECTOR)
+
+
+def evaluate_body(page: Page, expression: str, arg: Any = None) -> Any:
+    locator = body_locator(page)
+    if arg is None:
+        return locator.evaluate(expression)
+    return locator.evaluate(expression, arg)
+
+
+def fill_first_visible(page: Page, selectors: Sequence[str], value: str, timeout_ms: int = 1000) -> bool:
+    for selector in selectors:
+        locator = page.locator(selector)
+        try:
+            if locator.count() != 1:
+                continue
+            target = locator.first
+            if not target.is_visible():
+                continue
+            target.fill(value, timeout=timeout_ms)
+            return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
+def click_first_visible(page: Page, selectors: Sequence[str], timeout_ms: int = 1000) -> bool:
+    for selector in selectors:
+        locator = page.locator(selector)
+        try:
+            if locator.count() != 1:
+                continue
+            target = locator.first
+            if not target.is_visible():
+                continue
+            target.click(timeout=timeout_ms)
+            return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
+def find_best_captcha_locator(page: Page, min_width: int = 80, min_height: int = 20) -> Optional[Locator]:
+    images = page.locator(CAPTCHA_IMAGE_SELECTOR)
+    try:
+        count = images.count()
+    except Exception:  # noqa: BLE001
+        return None
+
+    best_locator: Optional[Locator] = None
+    best_area = 0.0
+    for index in range(count):
+        candidate = images.nth(index)
+        try:
+            if not candidate.is_visible():
+                continue
+            box = candidate.bounding_box()
+        except Exception:  # noqa: BLE001
+            continue
+
+        if not box:
+            continue
+
+        width = float(box.get("width") or 0)
+        height = float(box.get("height") or 0)
+        if width < min_width or height < min_height:
+            continue
+
+        area = width * height
+        if area > best_area:
+            best_area = area
+            best_locator = candidate
+
+    return best_locator
 
 class CaptchaCrackerAdapter:
     def __init__(self, verbose: bool = False, model_path: str = None, max_length: int = 4) -> None:
@@ -140,11 +249,12 @@ def js_wait_for_knockout(page: Page, timeout_ms: int = 15000) -> None:
     deadline = time.time() + (timeout_ms / 1000)
     while time.time() < deadline:
         try:
-            ready = page.evaluate(
+            ready = evaluate_body(
+                page,
                 """
-                () => {
+                (body) => {
                   try {
-                    return typeof ko !== 'undefined' && !!ko.dataFor(document.body);
+                    return typeof ko !== 'undefined' && !!ko.dataFor(body);
                   } catch (e) {
                     return false;
                   }
@@ -163,14 +273,15 @@ def js_wait_for_knockout(page: Page, timeout_ms: int = 15000) -> None:
 
 def js_change_month_and_select_day(page: Page, target_month: int, target_day: int) -> bool:
     return bool(
-        page.evaluate(
+        evaluate_body(
+            page,
             """
-            ({targetMonth, targetDay}) => {
+            (body, {targetMonth, targetDay}) => {
               function pad(str, max){
                 str = String(str);
                 return str.length < max ? pad("0" + str, max) : str;
               }
-              const vm = ko.dataFor(document.body);
+              const vm = ko.dataFor(body);
               if (!vm || !vm.currentMonth || !vm.monthCalendar || !vm.clickBookDate) return false;
 
               const currentMonth = new Date().getFullYear() + pad(targetMonth, 2);
@@ -196,9 +307,10 @@ def js_change_month_and_select_day(page: Page, target_month: int, target_day: in
 
 def js_ensure_month_and_day_selected(page: Page, target_month: int, target_day: int) -> bool:
     return bool(
-        page.evaluate(
+        evaluate_body(
+            page,
             """
-            ({targetMonth, targetDay}) => {
+            (body, {targetMonth, targetDay}) => {
               function pad(str, max){
                 str = String(str);
                 return str.length < max ? pad("0" + str, max) : str;
@@ -210,7 +322,7 @@ def js_ensure_month_and_day_selected(page: Page, target_month: int, target_day: 
                 return value === true || value === '1' || value === 1 || value === 'Y' || value === 'y';
               }
 
-              const vm = ko.dataFor(document.body);
+              const vm = ko.dataFor(body);
               if (!vm || !vm.currentMonth || !vm.monthCalendar || !vm.clickBookDate) return false;
 
               const expectedMonth = String(new Date().getFullYear()) + pad(targetMonth, 2);
@@ -297,14 +409,15 @@ def js_ensure_month_and_day_selected(page: Page, target_month: int, target_day: 
 
 def js_select_site(page: Page, area_name: int, site_no: int) -> bool:
     return bool(
-        page.evaluate(
+        evaluate_body(
+            page,
             """
-            ({areaName, siteNo}) => {
+            (body, {areaName, siteNo}) => {
               function pad(str, max){
                 str = String(str);
                 return str.length < max ? pad("0" + str, max) : str;
               }
-              const vm = ko.dataFor(document.body);
+              const vm = ko.dataFor(body);
               if (!vm || !vm.currentProductGroupCode || !vm.products || !vm.clickProduct) return false;
 
               vm.currentProductGroupCode(pad(Number(areaName) + 1, 4));
@@ -328,14 +441,15 @@ def js_scan_and_select_available(page: Page, target_month: int, target_day: int,
         area_code = idx%3+1
 #        area_code = random.randint(1, 3)
         selected = bool(
-            page.evaluate(
+            evaluate_body(
+                page,
                 """
-                ({areaCode}) => {
+                (body, {areaCode}) => {
                   function pad(str, max){
                     str = String(str);
                     return str.length < max ? pad("0" + str, max) : str;
                   }
-                  const vm = ko.dataFor(document.body);
+                  const vm = ko.dataFor(body);
                   if (!vm || !vm.currentProductGroupCode || !vm.products || !vm.clickProduct) return false;
 
                   vm.currentProductGroupCode(pad(areaCode, 4));
@@ -366,11 +480,15 @@ def js_scan_and_select_available(page: Page, target_month: int, target_day: int,
 
 
 def js_click_reservation(page: Page) -> bool:
+    if click_first_visible(page, RESERVATION_TRIGGER_SELECTORS):
+        return True
+
     return bool(
-        page.evaluate(
+        evaluate_body(
+            page,
             """
-            () => {
-              const vm = ko.dataFor(document.body);
+            (body) => {
+              const vm = ko.dataFor(body);
               if (!vm || !vm.clickReservation) return false;
               vm.clickReservation();
               return true;
@@ -381,18 +499,24 @@ def js_click_reservation(page: Page) -> bool:
 
 
 def js_fill_captcha_and_confirm(page: Page, captcha_text: str) -> bool:
+    normalized_text = re.sub(r"\s+", "", str(captcha_text or ""))
+    if normalized_text and fill_first_visible(page, CAPTCHA_INPUT_SELECTORS, normalized_text):
+        if click_first_visible(page, CAPTCHA_CONFIRM_SELECTORS):
+            return True
+
     return bool(
-        page.evaluate(
+        evaluate_body(
+            page,
             """
-            ({captchaText}) => {
-              const vm = ko.dataFor(document.body);
+            (body, {captchaText}) => {
+              const vm = ko.dataFor(body);
               if (!vm || !vm.captcha || !vm.clickReservationConfirm) return false;
               vm.captcha(String(captchaText).replace(/\s+/g, ''));
               vm.clickReservationConfirm();
               return true;
             }
             """,
-            {"captchaText": captcha_text},
+            {"captchaText": normalized_text},
         )
     )
 
@@ -403,7 +527,7 @@ def wait_and_capture_captcha(
     previous_signature: Optional[str] = None,
     min_bytes: int = 200,
 ) -> tuple[Optional[bytes], Optional[str]]:
-    """Capture captcha image bytes without Playwright locator APIs.
+    """Capture captcha image bytes using Playwright locators and screenshots.
 
     Returns image bytes and signature. If `previous_signature` is provided,
     waits for a different captcha image before returning.
@@ -411,101 +535,69 @@ def wait_and_capture_captcha(
     deadline = time.time() + (timeout_ms / 1000)
     while time.time() < deadline:
         try:
-            capture = page.evaluate(
-                """
-                () => {
-                  const candidates = Array.from(document.querySelectorAll('div.ex_area img'));
-                  if (!candidates.length) return null;
-
-                  let target = null;
-                  let bestArea = 0;
-                  candidates.forEach((img) => {
-                    const style = window.getComputedStyle(img);
-                    const visible =
-                        style.display !== 'none' &&
-                        style.visibility !== 'hidden' &&
-                        Number(style.opacity || '1') > 0 &&
-                        (img.offsetWidth > 0 || img.offsetHeight > 0);
-                    if (!visible || !img.complete) return;
-
-                    const width = img.naturalWidth || img.width || 0;
-                    const height = img.naturalHeight || img.height || 0;
-                    const area = width * height;
-                    if (area > bestArea) {
-                      bestArea = area;
-                      target = img;
-                    }
-                  });
-
-                  if (!target) return null;
-                  const width = target.naturalWidth || target.width;
-                  const height = target.naturalHeight || target.height;
-                  if (!width || !height || width < 80 || height < 20) return null;
-
-                  const canvas = document.createElement('canvas');
-                  canvas.width = width;
-                  canvas.height = height;
-                  const ctx = canvas.getContext('2d');
-                  if (!ctx) return null;
-                  ctx.drawImage(target, 0, 0, width, height);
-                  return {
-                    dataUrl: canvas.toDataURL('image/png'),
-                    width,
-                    height,
-                    src: target.currentSrc || target.getAttribute('src') || '',
-                  };
-                }
-                """
-            )
+            target = find_best_captcha_locator(page, min_width=80, min_height=20)
         except Exception:  # noqa: BLE001
-            capture = None
+            target = None
 
-        data_url = capture.get('dataUrl') if isinstance(capture, dict) else None
-        if data_url and isinstance(data_url, str) and data_url.startswith('data:image/') and ';base64,' in data_url:
-            try:
-                image_bytes = base64.b64decode(data_url.split(',', 1)[1])
-                signature = sha1(image_bytes).hexdigest()
-                if previous_signature and signature == previous_signature:
-                    time.sleep(0.1)
-                    continue
+        if target is None:
+            time.sleep(0.1)
+            continue
 
-                if len(image_bytes) < min_bytes:
-                    time.sleep(0.1)
-                    continue
+        try:
+            image_bytes = target.screenshot(type="png")
+            signature = sha1(image_bytes).hexdigest()
+            if previous_signature and signature == previous_signature:
+                time.sleep(0.1)
+                continue
 
-                img_array = np.frombuffer(image_bytes, dtype=np.uint8)
-                decoded = cv2.imdecode(img_array, cv2.IMREAD_GRAYSCALE)
-                if decoded is None:
-                    time.sleep(0.1)
-                    continue
+            if len(image_bytes) < min_bytes:
+                time.sleep(0.1)
+                continue
 
-                height, width = decoded.shape[:2]
-                if width < 80 or height < 20:
-                    time.sleep(0.1)
-                    continue
+            img_array = np.frombuffer(image_bytes, dtype=np.uint8)
+            decoded = cv2.imdecode(img_array, cv2.IMREAD_GRAYSCALE)
+            if decoded is None:
+                time.sleep(0.1)
+                continue
 
-                return image_bytes, signature
+            height, width = decoded.shape[:2]
+            if width < 80 or height < 20:
+                time.sleep(0.1)
+                continue
 
-            except Exception:  # noqa: BLE001
-                return None, None
+            return image_bytes, signature
+
+        except Exception:  # noqa: BLE001
+            time.sleep(0.1)
+            continue
 
         time.sleep(0.1)
 
     return None, None
 
 def dummy_call(page: Page) -> None:
-    page.evaluate(
-        """
-        () => {
-          const img = document.querySelector('div.ex_area img');
-        }
-        """
-    )
-
+    page.locator(CAPTCHA_IMAGE_SELECTOR).count()
     return None
 
 
+def auto_login(page: Page, id: str, pw: str) -> None:
+    page.locator(LOGIN_ID_SELECTOR).fill(id)
+    page.locator(LOGIN_PASSWORD_SELECTOR).fill(pw)
 
+    if click_first_visible(page, LOGIN_TRIGGER_SELECTORS):
+        return
+
+    evaluate_body(
+        page,
+        """
+        (body) => {
+          const vm = ko.dataFor(body);
+          if (!vm || !vm.login) return false;
+        
+          vm.login();
+        }
+        """
+    )
 
 def install_js_runtime_guards(context: BrowserContext) -> None:
     """Guard native constructors from page-side monkey patching.
@@ -591,8 +683,12 @@ def run_macro(cfg: MacroConfig) -> None:
         dialog_tracker = DialogTracker()
         bind_dialog_auto_accept(page, dialog_tracker, cfg)
 
-        print("[INFO] 로그인 완료 상태를 확인한 뒤 엔터를 누르세요.")
-        input()
+        if cfg.login_id is None:
+            print("[INFO] 로그인 완료 상태를 확인한 뒤 엔터를 누르세요.")
+            input()
+        else:
+            auto_login(page, cfg.login_id, cfg.login_pw)
+            print("[INFO] 로그인 완료.")
 
         last_reload = time.time()
 
@@ -759,6 +855,8 @@ def parse_args() -> MacroConfig:
     parser.add_argument("--telegram-bot-token", type=str, default=os.getenv("TELEGRAM_BOT_TOKEN"))
     parser.add_argument("--telegram-chat-id", type=str, default=os.getenv("TELEGRAM_CHAT_ID"))
     parser.add_argument("--captcha-model-path", type=str, default=os.getenv("CAPTCHA_MODEL_PATH"))
+    parser.add_argument("--login-id", type=str, default=os.getenv("LOGIN_ID"))
+    parser.add_argument("--login-pw", type=str, default=os.getenv("LOGIN_PW"))
     parser.add_argument("--captcha-dump-path", type=str, default=None)
     parser.add_argument("--max-attempts", type=int, default=8)
     parser.add_argument("--verbose", type=bool, default=False)
@@ -775,7 +873,9 @@ def parse_args() -> MacroConfig:
         telegram_chat_id=args.telegram_chat_id,
         captcha_model_path=args.captcha_model_path,
         captcha_max_attempts_per_reservation=args.max_attempts,
-        verbose=args.verbose
+        verbose=args.verbose,
+        login_id=args.login_id,
+        login_pw=args.login_pw
     )
 
 
