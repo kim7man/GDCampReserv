@@ -18,6 +18,7 @@ import os
 import random
 import re
 import time
+import json
 from datetime import datetime
 from hashlib import sha1
 from dataclasses import dataclass
@@ -31,34 +32,19 @@ import cv2
 import numpy as np
 from digit_ocr import load_digit_model, predict_digit_string
 
+#    "button[type='submit']",
+#    "div[class^='captcha']",
+#    "input[id*='captcha']",
+#    "button:has-text('로그인')",
+#    "a:has-text('로그인')",
+
 BODY_SELECTOR = "body"
 CAPTCHA_IMAGE_SELECTOR = "div.ex_area img"
 LOGIN_ID_SELECTOR = "input#login_id"
 LOGIN_PASSWORD_SELECTOR = "input#login_passwd"
-LOGIN_TRIGGER_SELECTORS = (
-    "button[type='submit']",
-    "input[type='submit']",
-    "button:has-text('로그인')",
-    "a:has-text('로그인')",
-)
-RESERVATION_TRIGGER_SELECTORS = (
-    "button:has-text('예약하기')",
-    "a:has-text('예약하기')",
-    "button:has-text('예약')",
-    "a:has-text('예약')",
-)
-CAPTCHA_INPUT_SELECTORS = (
-    "input[name='captcha']",
-    "input#captcha",
-    "input[id*='captcha']",
-    "input[name*='captcha']",
-)
-CAPTCHA_CONFIRM_SELECTORS = (
-    "button:has-text('확인')",
-    "a:has-text('확인')",
-    "button:has-text('예약확정')",
-    "a:has-text('예약확정')",
-)
+POPUP_CHECKER_SELECTOR = "div[id^='notice_layer_'] input"
+POPUP_BUTTON_SELECTOR = "div[id^='notice_layer_'] button"
+POPUP_BACKGROUND_SELECTOR = "div[class^='notice_bg']"
 
 
 @dataclass
@@ -80,7 +66,6 @@ class MacroConfig:
     login_pw: Optional[str] = None
 
 
-
 def debug_log(cfg: Optional[MacroConfig], message: str) -> None:
     if cfg is not None and cfg.verbose:
         print(f"[DEBUG] {message}")
@@ -97,70 +82,10 @@ def evaluate_body(page: Page, expression: str, arg: Any = None) -> Any:
     return locator.evaluate(expression, arg)
 
 
-def fill_first_visible(page: Page, selectors: Sequence[str], value: str, timeout_ms: int = 1000) -> bool:
-    for selector in selectors:
-        locator = page.locator(selector)
-        try:
-            if locator.count() != 1:
-                continue
-            target = locator.first
-            if not target.is_visible():
-                continue
-            target.fill(value, timeout=timeout_ms)
-            return True
-        except Exception:  # noqa: BLE001
-            continue
-    return False
-
-
-def click_first_visible(page: Page, selectors: Sequence[str], timeout_ms: int = 1000) -> bool:
-    for selector in selectors:
-        locator = page.locator(selector)
-        try:
-            if locator.count() != 1:
-                continue
-            target = locator.first
-            if not target.is_visible():
-                continue
-            target.click(timeout=timeout_ms)
-            return True
-        except Exception:  # noqa: BLE001
-            continue
-    return False
-
-
-def find_best_captcha_locator(page: Page, min_width: int = 80, min_height: int = 20) -> Optional[Locator]:
+def captcha_locator(page: Page, min_width: int = 80, min_height: int = 20) -> Optional[Locator]:
     images = page.locator(CAPTCHA_IMAGE_SELECTOR)
-    try:
-        count = images.count()
-    except Exception:  # noqa: BLE001
-        return None
+    return images
 
-    best_locator: Optional[Locator] = None
-    best_area = 0.0
-    for index in range(count):
-        candidate = images.nth(index)
-        try:
-            if not candidate.is_visible():
-                continue
-            box = candidate.bounding_box()
-        except Exception:  # noqa: BLE001
-            continue
-
-        if not box:
-            continue
-
-        width = float(box.get("width") or 0)
-        height = float(box.get("height") or 0)
-        if width < min_width or height < min_height:
-            continue
-
-        area = width * height
-        if area > best_area:
-            best_area = area
-            best_locator = candidate
-
-    return best_locator
 
 class CaptchaSolver:
     def __init__(self, verbose: bool = False, model_path: str = None, max_length: int = 4) -> None:
@@ -222,6 +147,7 @@ def dump_captcha_image(captcha_bytes: bytes, dump_dir: Optional[str]) -> Optiona
         print(f"[WARN] captcha dump 저장 실패: {exc}")
         return None
 
+
 def send_telegram(bot_token: Optional[str], chat_id: Optional[str], msg: str) -> None:
     if not bot_token or not chat_id:
         return
@@ -234,7 +160,16 @@ def send_telegram(bot_token: Optional[str], chat_id: Optional[str], msg: str) ->
     url = f"{base}?{query}"
     try:
         with urllib.request.urlopen(url, timeout=10) as resp:
-            resp.read()
+            # response가 byte 타입이므로 json.loads()가 이를 처리합니다.
+            respData = json.loads(resp.read())
+    
+            print(respData)
+            # 'ok' 값에 따른 조건문 처리
+            if respData.get("ok") is True:
+                print("[INFO] 발신 성공.")
+            else:
+                print("[WARN] 발신 실패.")
+
     except Exception as exc:  # noqa: BLE001
         print(f"[WARN] Telegram send failed: {exc}")
 
@@ -454,9 +389,6 @@ def js_scan_and_select_available(page: Page, target_month: int, target_day: int,
 
 
 def js_click_reservation(page: Page) -> bool:
-    if click_first_visible(page, RESERVATION_TRIGGER_SELECTORS):
-        return True
-
     return bool(
         evaluate_body(
             page,
@@ -473,11 +405,6 @@ def js_click_reservation(page: Page) -> bool:
 
 
 def js_fill_captcha_and_confirm(page: Page, captcha_text: str) -> bool:
-    normalized_text = re.sub(r"\s+", "", str(captcha_text or ""))
-    if normalized_text and fill_first_visible(page, CAPTCHA_INPUT_SELECTORS, normalized_text):
-        if click_first_visible(page, CAPTCHA_CONFIRM_SELECTORS):
-            return True
-
     return bool(
         evaluate_body(
             page,
@@ -490,7 +417,7 @@ def js_fill_captcha_and_confirm(page: Page, captcha_text: str) -> bool:
               return true;
             }
             """,
-            {"captchaText": normalized_text},
+            {"captchaText": captcha_text},
         )
     )
 
@@ -509,43 +436,43 @@ def wait_and_capture_captcha(
     deadline = time.time() + (timeout_ms / 1000)
     while time.time() < deadline:
         try:
-            target = find_best_captcha_locator(page, min_width=80, min_height=20)
+            target = captcha_locator(page, min_width=200, min_height=50)
         except Exception:  # noqa: BLE001
             target = None
 
         if target is None:
-            time.sleep(0.1)
+            time.sleep(0.01)
             continue
 
         try:
             image_bytes = target.screenshot(type="png")
             signature = sha1(image_bytes).hexdigest()
             if previous_signature and signature == previous_signature:
-                time.sleep(0.1)
+                time.sleep(0.01)
                 continue
 
             if len(image_bytes) < min_bytes:
-                time.sleep(0.1)
+                time.sleep(0.01)
                 continue
 
             img_array = np.frombuffer(image_bytes, dtype=np.uint8)
             decoded = cv2.imdecode(img_array, cv2.IMREAD_GRAYSCALE)
             if decoded is None:
-                time.sleep(0.1)
+                time.sleep(0.01)
                 continue
 
             height, width = decoded.shape[:2]
             if width < 80 or height < 20:
-                time.sleep(0.1)
+                time.sleep(0.01)
                 continue
 
             return image_bytes, signature
 
         except Exception:  # noqa: BLE001
-            time.sleep(0.1)
+            time.sleep(0.01)
             continue
 
-        time.sleep(0.1)
+        time.sleep(0.01)
 
     return None, None
 
@@ -558,9 +485,6 @@ def auto_login(page: Page, id: str, pw: str) -> None:
     page.locator(LOGIN_ID_SELECTOR).fill(id)
     page.locator(LOGIN_PASSWORD_SELECTOR).fill(pw)
 
-    if click_first_visible(page, LOGIN_TRIGGER_SELECTORS):
-        return
-
     evaluate_body(
         page,
         """
@@ -572,6 +496,19 @@ def auto_login(page: Page, id: str, pw: str) -> None:
         }
         """
     )
+
+def popup_closer(page: Page) -> None:
+    checkBoxes = page.locator(POPUP_CHECKER_SELECTOR)
+    buttons = page.locator(POPUP_BUTTON_SELECTOR)
+    bg = page.locator(POPUP_BACKGROUND_SELECTOR)
+
+    count = checkBoxes.count()
+    for index in range(count):
+        checkBoxes.nth(index).evaluate("node => node.checked='true'")
+        buttons.nth(index).evaluate("node => window.hideNoticeLayer(node)")
+    bg.first.evaluate("node => node.style.display='none'")
+
+
 
 def install_js_runtime_guards(context: BrowserContext) -> None:
     """Guard native constructors from page-side monkey patching.
@@ -664,6 +601,10 @@ def run_macro(cfg: MacroConfig) -> None:
             auto_login(page, cfg.login_id, cfg.login_pw)
             print("[INFO] 로그인 완료.")
 
+
+        popup_closer(page)
+        
+
         last_reload = time.time()
 
         while True:
@@ -696,7 +637,8 @@ def run_macro(cfg: MacroConfig) -> None:
                 debug_log(cfg, f"site selection result={ok}")
 
                 if not ok:
-                    print("[WARN] 빈 자리 확인 불가 -> reload")
+                    if cfg.verbose:
+                        print("[WARN] 빈 자리 확인 불가 -> reload")
                     last_reload = time.time()
                     page.reload(wait_until="domcontentloaded")
                     continue
@@ -761,14 +703,14 @@ def run_macro(cfg: MacroConfig) -> None:
 
                     last_captcha_signature = captcha_signature
                     if detected:
-                        print(f"[WARN] captcha 오답 alert 감지 -> 재시도 (msg: {dialog_tracker.last_message})")
-                        continue
-
-
-                    print("[INFO] captcha 입력 및 confirm 완료")
-                    time.sleep(3)
-                    captcha_solved = True
-                    break
+                        print("[INFO] captcha 입력 및 confirm 완료")
+                        if dialog_tracker.last_message and "완료되었습니다" in str(dialog_tracker.last_message):
+                            print(f"[WARN] 예약 완료 -> (msg: {dialog_tracker.last_message})")
+                            captcha_solved = True
+                            break
+                        else:
+                            print(f"[WARN] alert 감지 -> (msg: {dialog_tracker.last_message})")
+                            continue
 
                 if not captcha_solved:
                     print("[WARN] captcha 최대 재시도 초과 또는 처리 실패 -> 메인 루프 재시작")
