@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "강동캠핑 예약",
+  "description": "강동캠핑 예약",
+  "version": "1.0.0",
+  "host_permissions": [
+    "https://camp.xticket.kr/"
+  ],
+  "permissions": [
+    "downloads",
+	"scripting",
+	"storage"
+  ],
+  "icons": {
+      "128": "images/icon128.png"
+  },
+  "content_scripts": [ {
+    "all_frames": true,
+    "js": ["jquery-3.7.0.min.js", "tesseract.min.js", "content.js"],
+    "matches": ["https://camp.xticket.kr/*"],
+    "run_at": "document_end"
+  }],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "web_accessible_resources": [
+  {
+    "resources": ["injectedScript.js", "tesseract.min.js", "images/*", "assets/*"],
+	"matches": ["https://camp.xticket.kr/*"]
+  }
+  ],
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": false
+  }
+}
