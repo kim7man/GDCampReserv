@@ -61,14 +61,15 @@ class MacroConfig:
     captcha_dump_dir: Optional[str] = None
     captcha_model_path: str = None
     verbose: bool = False
-    captcha_max_attempts_per_reservation: int = 8
+    captcha_max_attempts_per_reservation: int = 20
     login_id: Optional[str] = None
     login_pw: Optional[str] = None
 
 
 def debug_log(cfg: Optional[MacroConfig], message: str) -> None:
     if cfg is not None and cfg.verbose:
-        print(f"[DEBUG] {message}")
+        timestamp = datetime.now().strftime("%Y.%m.%d %H:%M:%S")
+        print(f"{timestamp} : [DEBUG] {message}")
 
 
 def body_locator(page: Page) -> Locator:
@@ -96,7 +97,8 @@ class CaptchaSolver:
 
     def _log(self, msg: str) -> None:
         if self._verbose:
-            print(f"[DEBUG][OCR] {msg}")
+            timestamp = datetime.now().strftime("%Y.%m.%d %H:%M:%S")
+            print(f"{timestamp} : [DEBUG][OCR] {msg}")
 
     def solve_bytes(self, image_bytes: bytes) -> str:
         self._log(f"solve_bytes start size={len(image_bytes)}")
@@ -137,14 +139,15 @@ def dump_captcha_image(captcha_bytes: bytes, dump_dir: Optional[str]) -> Optiona
         return None
     try:
         os.makedirs(dump_dir, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        timestamp = datetime.now().strftime("%Y.%m.%d %H:%M:%S")
         ext = guess_image_extension(captcha_bytes)
         path = os.path.join(dump_dir, f"captcha_{timestamp}{ext}")
         with open(path, "wb") as f:
             f.write(captcha_bytes)
         return path
     except Exception as exc:  # noqa: BLE001
-        print(f"[WARN] captcha dump 저장 실패: {exc}")
+        timestamp = datetime.now().strftime("%Y.%m.%d %H:%M:%S")
+        print(f"{timestamp} : [WARN] captcha dump 저장 실패: {exc}")
         return None
 
 
@@ -166,12 +169,15 @@ def send_telegram(bot_token: Optional[str], chat_id: Optional[str], msg: str) ->
             print(respData)
             # 'ok' 값에 따른 조건문 처리
             if respData.get("ok") is True:
-                print("[INFO] 발신 성공.")
+                timestamp = datetime.now().strftime("%Y.%m.%d %H:%M:%S")
+                print(f"{timestamp} : [INFO] 발신 성공.")
             else:
-                print("[WARN] 발신 실패.")
+                timestamp = datetime.now().strftime("%Y.%m.%d %H:%M:%S")
+                print(f"{timestamp} : [WARN] 발신 실패.")
 
     except Exception as exc:  # noqa: BLE001
-        print(f"[WARN] Telegram send failed: {exc}")
+        timestamp = datetime.now().strftime("%Y.%m.%d %H:%M:%S")
+        print(f"{timestamp} : [WARN] Telegram send failed: {exc}")
 
 
 def js_wait_for_knockout(page: Page, timeout_ms: int = 15000) -> None:
@@ -481,6 +487,19 @@ def dummy_call(page: Page) -> None:
     return None
 
 
+def isLogined(page: Page) -> bool:
+    res = evaluate_body(
+        page,
+        """
+        (body) => {
+          const vm = ko.dataFor(body);
+          if (vm.isLogined()) return true;
+          return false;
+        }
+        """
+    )
+    return bool(res)
+
 def auto_login(page: Page, id: str, pw: str) -> None:
     page.locator(LOGIN_ID_SELECTOR).fill(id)
     page.locator(LOGIN_PASSWORD_SELECTOR).fill(pw)
@@ -594,21 +613,23 @@ def run_macro(cfg: MacroConfig) -> None:
         dialog_tracker = DialogTracker()
         bind_dialog_auto_accept(page, dialog_tracker, cfg)
 
-        if cfg.login_id is None:
-            print("[INFO] 로그인 완료 상태를 확인한 뒤 엔터를 누르세요.")
-            input()
-        else:
-            auto_login(page, cfg.login_id, cfg.login_pw)
-            print("[INFO] 로그인 완료.")
-
-
-        popup_closer(page)
-        
 
         last_reload = time.time()
 
         while True:
             try:
+                if not isLogined(page):
+                    if cfg.login_id is None:
+                        timestamp = datetime.now().strftime("%Y.%m.%d %H:%M:%S")
+                        print(f"{timestamp} : [INFO] 로그인 완료 상태를 확인한 뒤 엔터를 누르세요.")
+                        input()
+                    else:
+                        auto_login(page, cfg.login_id, cfg.login_pw)
+                        timestamp = datetime.now().strftime("%Y.%m.%d %H:%M:%S")
+                        print(f"{timestamp} : [INFO] 로그인 완료.")
+
+                popup_closer(page)
+        
                 if time.time() - last_reload > cfg.reload_interval_s:
                     page.reload(wait_until="domcontentloaded")
                     last_reload = time.time()
@@ -621,7 +642,8 @@ def run_macro(cfg: MacroConfig) -> None:
                 ok = js_change_month_and_select_day(page, cfg.target_month, cfg.target_day)
                 debug_log(cfg, f"select month/day result={ok}")
                 if not ok:
-                    print("[WARN] 날짜 탐색 실패 -> reload")
+                    timestamp = datetime.now().strftime("%Y.%m.%d %H:%M:%S")
+                    print(f"{timestamp} : [WARN] 날짜 탐색 실패 -> reload")
                     last_reload = time.time()
                     page.reload(wait_until="domcontentloaded")
                     continue
@@ -638,7 +660,8 @@ def run_macro(cfg: MacroConfig) -> None:
 
                 if not ok:
                     if cfg.verbose:
-                        print("[WARN] 빈 자리 확인 불가 -> reload")
+                        timestamp = datetime.now().strftime("%Y.%m.%d %H:%M:%S")
+                        print(f"{timestamp} : [WARN] 빈 자리 확인 불가 -> reload")
                     last_reload = time.time()
                     page.reload(wait_until="domcontentloaded")
                     continue
@@ -646,7 +669,8 @@ def run_macro(cfg: MacroConfig) -> None:
                 time.sleep(0.2)
 
                 if not js_click_reservation(page):
-                    print("[WARN] 예약 클릭 실패 -> reload")
+                    timestamp = datetime.now().strftime("%Y.%m.%d %H:%M:%S")
+                    print(f"{timestamp} : [WARN] 예약 클릭 실패 -> reload")
                     last_reload = time.time()
                     page.reload(wait_until="domcontentloaded")
                     continue
@@ -661,22 +685,26 @@ def run_macro(cfg: MacroConfig) -> None:
                     )
                     debug_log(cfg, f"captcha bytes captured={0 if not captcha_bytes else len(captcha_bytes)}")
                     if not captcha_bytes:
-                        print("[WARN] captcha 이미지 대기 실패 -> reload")
+                        timestamp = datetime.now().strftime("%Y.%m.%d %H:%M:%S")
+                        print(f"{timestamp} : [WARN] captcha 이미지 대기 실패 -> reload")
                         last_reload = time.time()
                         page.reload(wait_until="domcontentloaded")
                         break
 
                     dump_path = dump_captcha_image(captcha_bytes, cfg.captcha_dump_dir)
                     if dump_path:
-                        print(f"[INFO] captcha image saved: {dump_path}")
+                        timestamp = datetime.now().strftime("%Y.%m.%d %H:%M:%S")
+                        print(f"{timestamp} : [INFO] captcha image saved: {dump_path}")
 
                     debug_log(cfg, "ocr solving start")
                     captcha_text = cracker.solve_bytes(captcha_bytes)
                     debug_log(cfg, f"ocr solving done text_len={len(captcha_text) if captcha_text else 0}")
-                    print(f"[INFO] captcha text: {captcha_text}")
+                    timestamp = datetime.now().strftime("%Y.%m.%d %H:%M:%S")
+                    print(f"{timestamp} : [INFO] captcha text: {captcha_text}")
 
                     if not captcha_text:
-                        print("[WARN] captcha OCR empty -> 다음 captcha 재시도")
+                        timestamp = datetime.now().strftime("%Y.%m.%d %H:%M:%S")
+                        print(f"{timestamp} : [WARN] captcha OCR empty -> 다음 captcha 재시도")
                         continue
 
                     submitted_at = time.time()
@@ -684,7 +712,8 @@ def run_macro(cfg: MacroConfig) -> None:
                     ok = js_fill_captcha_and_confirm(page, captcha_text)
                     debug_log(cfg, f"captcha confirm click result={ok}")
                     if not ok:
-                        print("[WARN] captcha confirm 실패 -> reload")
+                        timestamp = datetime.now().strftime("%Y.%m.%d %H:%M:%S")
+                        print(f"{timestamp} : [WARN] captcha confirm 실패 -> reload")
                         last_reload = time.time()
                         page.reload(wait_until="domcontentloaded")
                         break
@@ -703,32 +732,40 @@ def run_macro(cfg: MacroConfig) -> None:
 
                     last_captcha_signature = captcha_signature
                     if detected:
-                        print("[INFO] captcha 입력 및 confirm 완료")
+                        timestamp = datetime.now().strftime("%Y.%m.%d %H:%M:%S")
+                        print(f"{timestamp} : [INFO] captcha 입력 및 confirm 완료")
                         if dialog_tracker.last_message and "완료되었습니다" in str(dialog_tracker.last_message):
-                            print(f"[WARN] 예약 완료 -> (msg: {dialog_tracker.last_message})")
+                            timestamp = datetime.now().strftime("%Y.%m.%d %H:%M:%S")
+                            print(f"{timestamp} : [WARN] 예약 완료 -> (msg: {dialog_tracker.last_message})")
                             captcha_solved = True
                             break
                         else:
-                            print(f"[WARN] alert 감지 -> (msg: {dialog_tracker.last_message})")
+                            timestamp = datetime.now().strftime("%Y.%m.%d %H:%M:%S")
+                            print(f"{timestamp} : [WARN] alert 감지 -> (msg: {dialog_tracker.last_message})")
                             continue
 
                 if not captcha_solved:
-                    print("[WARN] captcha 최대 재시도 초과 또는 처리 실패 -> 메인 루프 재시작")
+                    timestamp = datetime.now().strftime("%Y.%m.%d %H:%M:%S")
+                    print(f"{timestamp} : [WARN] captcha 최대 재시도 초과 또는 처리 실패 -> 메인 루프 재시작")
                     continue
                 else:
                     send_telegram(cfg.telegram_bot_token, cfg.telegram_chat_id, "Check Gangdong reservation.")
-                    print("[INFO] 예약 성공")
+                    timestamp = datetime.now().strftime("%Y.%m.%d %H:%M:%S")
+                    print(f"{timestamp} : [INFO] 예약 성공")
                     break
 
             except KeyboardInterrupt:
-                print("[INFO] 사용자 중단")
+                timestamp = datetime.now().strftime("%Y.%m.%d %H:%M:%S")
+                print(f"{timestamp} : [INFO] 사용자 중단")
                 break
             except Exception as exc:  # noqa: BLE001
-                print(f"[WARN] 예외 발생: {exc} -> reload")
+                timestamp = datetime.now().strftime("%Y.%m.%d %H:%M:%S")
+                print(f"{timestamp} : [WARN] 예외 발생: {exc} -> reload")
                 debug_log(cfg, f"exception type={type(exc).__name__}")
                 try:
                     if is_known_playwright_eval_runtime_error(exc):
-                        print("[WARN] Playwright evaluate runtime 오염 감지 -> context 재생성")
+                        timestamp = datetime.now().strftime("%Y.%m.%d %H:%M:%S")
+                        print(f"{timestamp} : [WARN] Playwright evaluate runtime 오염 감지 -> context 재생성")
                         context.close()
                         context = browser.new_context()
                         install_js_runtime_guards(context)

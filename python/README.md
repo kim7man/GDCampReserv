@@ -42,5 +42,6 @@ python gdcamp_macro.py \
 6. OCR 수행
 7. CAPTCHA 입력 + 예약 확정 클릭
 8. 실패 시 reload 후 재시도
+9. 성공 시 telegram 메시지 전송
 
 > 참고: 사이트 UI/뷰모델 구조가 변경되면 evaluate 내부 JS 셀렉터/속성명을 업데이트해야 합니다.
